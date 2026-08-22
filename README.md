@@ -422,6 +422,29 @@ NextDNS: `https://dns.nextdns.io/<ваш-id>`. Пакет `https-dns-proxy` в
 выдаются вовсе — домены резолвит провайдер, обход продолжает работать, а
 диагностика говорит, что поставить.
 
+> **Важно после `apk add https-dns-proxy`.** У пакета есть собственный
+> init-сервис, и при установке он сам стартует и переписывает DNS всей сети
+> на себя — ставит `noresolv` и направляет dnsmasq на свои экземпляры
+> `127.0.0.1#5053/5054` с резолвером Google по умолчанию. У многих
+> провайдеров он не отвечает, и тогда перестаёт открываться всё, кроме
+> доменов из списков. Нам нужен только его бинарник, свой экземпляр мы
+> поднимаем сами, поэтому пакетный сервис надо выключить:
+>
+> ```sh
+> /etc/init.d/https-dns-proxy stop
+> /etc/init.d/https-dns-proxy disable
+> uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#5053'
+> uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#5054'
+> uci -q delete dhcp.@dnsmasq[0].noresolv
+> uci -q delete dhcp.@dnsmasq[0].doh_server
+> uci -q delete dhcp.@dnsmasq[0].doh_backup_server
+> uci -q delete dhcp.@dnsmasq[0].doh_backup_noresolv
+> uci commit dhcp && /etc/init.d/dnsmasq restart
+> ```
+>
+> Вкладка «Диагностика» замечает включённый пакетный сервис и предупреждает
+> об этом.
+
 **`provider`** — своего резолвера не задаём, домены резолвит то, что уже
 настроено на роутере.
 
