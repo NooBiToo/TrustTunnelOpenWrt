@@ -15,11 +15,56 @@ zone_exists=""
 # библиотеки OpenWrt — ни того, ни другого линтер статически не видит.
 # shellcheck disable=SC2329,SC2317,SC2154
 find_zone() {
-	config_get _zname "" name
+	config_get _zname "$1" name
 	[ "$_zname" = "trusttunnel" ] && zone_exists=1
 }
 config_load firewall
 config_foreach find_zone zone
+
+# Схлопывание дубликатов зоны. Ранняя версия этого скрипта читала имя зоны с
+# ПУСТЫМ аргументом секции (`config_get _zname "" name` вместо `"$1"`), поэтому
+# zone_exists никогда не выставлялся и блок создания срабатывал при КАЖДОЙ
+# установке. На живом роутере накопилось три одинаковых зоны trusttunnel и три
+# правила forwarding — каждая генерирует `define trusttunnel_devices`, fw4
+# падал с «redefinition of symbol», и весь фаервол не поднимался: сеть теряла
+# пересылку из LAN в WAN, а работали только домены из списков, потому что их
+# маскарадит НАША зона в своей таблице.
+#
+# Оставляем первую зону trusttunnel и первое forwarding на неё, лишние удаляем.
+# Идёт до создания, чтобы не считать дубли отсутствием зоны.
+_seen_zone=0
+# config_foreach + config_get, линтеру не видны.
+# shellcheck disable=SC2329,SC2317,SC2154
+dedup_zone() {
+	config_get _n "$1" name
+	[ "$_n" = "trusttunnel" ] || return 0
+	if [ "$_seen_zone" = "1" ]; then
+		uci delete "firewall.$1"
+		zone_deduped=1
+	else
+		_seen_zone=1
+	fi
+}
+_seen_fwd=0
+# shellcheck disable=SC2329,SC2317,SC2154
+dedup_fwd() {
+	config_get _d "$1" dest
+	[ "$_d" = "trusttunnel" ] || return 0
+	if [ "$_seen_fwd" = "1" ]; then
+		uci delete "firewall.$1"
+		zone_deduped=1
+	else
+		_seen_fwd=1
+	fi
+}
+zone_deduped=""
+config_foreach dedup_zone zone
+config_foreach dedup_fwd forwarding
+if [ -n "$zone_deduped" ]; then
+	uci commit firewall
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	logger -t trusttunnel "removed duplicate firewall zones left by an earlier version"
+fi
 
 if [ -z "$zone_exists" ]; then
 	z=$(uci add firewall zone)
@@ -64,7 +109,7 @@ fi
 # Тот же случай: вызов через config_foreach, присваивание через config_get.
 # shellcheck disable=SC2329,SC2317,SC2154
 migrate_zone_device() {
-	config_get _zn "" name
+	config_get _zn "$1" name
 	[ "$_zn" = "trusttunnel" ] || return 0
 	_devs=$(uci -q get "firewall.$1.device" 2>/dev/null)
 	case " $_devs " in

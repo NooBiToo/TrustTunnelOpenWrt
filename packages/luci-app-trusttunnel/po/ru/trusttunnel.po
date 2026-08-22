@@ -1001,3 +1001,15 @@ msgstr "Либо этот dnsmasq не умеет nftset, либо сгенер�
 
 msgid "The nftables table is gone; restart the service."
 msgstr "Таблица nftables исчезла; перезапустите службу."
+
+msgid "Stock https-dns-proxy service"
+msgstr "Пакетный сервис https-dns-proxy"
+
+msgid "it has rewritten the DNS of the whole network"
+msgstr "он переписал DNS всей сети на себя"
+
+msgid "enabled, and will rewrite the DNS of the whole network on start"
+msgstr "включён и при запуске перепишет DNS всей сети на себя"
+
+msgid "This package only needs its binary — the service is separate. Disable it and clean up: /etc/init.d/https-dns-proxy stop; /etc/init.d/https-dns-proxy disable; then remove server=127.0.0.1#5053/5054, noresolv and every doh_* option from the dhcp config and restart dnsmasq."
+msgstr "Нашему пакету нужен только его бинарник — сервис отдельный. Отключите его и приберите: /etc/init.d/https-dns-proxy stop; /etc/init.d/https-dns-proxy disable; затем уберите server=127.0.0.1#5053/5054, noresolv и все опции doh_* из конфига dhcp и перезапустите dnsmasq."

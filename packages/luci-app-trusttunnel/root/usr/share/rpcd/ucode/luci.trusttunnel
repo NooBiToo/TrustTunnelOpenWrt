@@ -647,6 +647,29 @@ return {
 				tun ? '/dev/net/tun present' : 'missing',
 				tun ? '' : 'Install kmod-tun.');
 
+			// Пакетный init https-dns-proxy. Мы используем только его БИНАРНИК,
+			// поднимая свой экземпляр, а его собственный сервис при установке
+			// сам стартует и переписывает dnsmasq всей сети на себя: ставит
+			// noresolv и server=127.0.0.1#5053/5054, где 5053 — DoH Google,
+			// который у российских провайдеров часто не отвечает. Проверено на
+			// живом роутере: картина «работают только сайты из списков» — их
+			// домены шли мимо, на наш экземпляр. Отдельная ловушка: его бэкап
+			// для восстановления (doh_backup_server) загрязняется его же
+			// записями, поэтому одного stop мало — остатки надо чистить.
+			//
+			// Проверка показывается ТОЛЬКО когда есть что чинить: включённый
+			// сервис или его следы в конфиге dhcp. Молчаливая зелёная строка
+			// «конфликта нет» была бы шумом.
+			let stock_doh_on = access('/etc/init.d/https-dns-proxy') &&
+				sh('/etc/init.d/https-dns-proxy enabled').code == 0;
+			let stock_doh_marks = length(uciget('dhcp.@dnsmasq[0].doh_server')) > 0;
+			if (stock_doh_on || stock_doh_marks)
+				add('prereq', 'Stock https-dns-proxy service',
+					stock_doh_marks ? 'fail' : 'warn',
+					stock_doh_marks ? 'it has rewritten the DNS of the whole network'
+						: 'enabled, and will rewrite the DNS of the whole network on start',
+					'This package only needs its binary — the service is separate. Disable it and clean up: /etc/init.d/https-dns-proxy stop; /etc/init.d/https-dns-proxy disable; then remove server=127.0.0.1#5053/5054, noresolv and every doh_* option from the dhcp config and restart dnsmasq.');
+
 			// --- Служба ---
 			add('service', 'Enabled', enabled ? 'ok' : 'warn',
 				enabled ? 'yes' : 'no',
