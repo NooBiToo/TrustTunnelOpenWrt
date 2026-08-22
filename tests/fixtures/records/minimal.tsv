@@ -1,0 +1,8 @@
+main.enabled	1
+main.mode	selective
+endpoint.hostname	vpn.example.com
+endpoint.address	1.2.3.4:443
+endpoint.username	alice
+endpoint.password	s3cret
+network.device	tt0
+network.mtu	1350

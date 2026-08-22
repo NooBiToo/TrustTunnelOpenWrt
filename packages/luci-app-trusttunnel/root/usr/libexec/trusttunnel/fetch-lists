@@ -1,0 +1,120 @@
+#!/bin/sh
+# Скачивает выбранные списки в <lists-dir>. Существующая копия заменяется
+# только если новая непустая; иначе остаётся прежняя.
+# Использование: fetch-lists <records-file> <lists-dir>
+set -u
+
+TT_LIBDIR="${TT_LIBDIR:-$(dirname "$0")}"
+# Путь вычисляется во время работы, статически линтеру его не разрешить.
+# shellcheck disable=SC1091
+. "$TT_LIBDIR/records.sh"
+
+# TT_RECORDS читает подключённый records.sh через tt_get/tt_list — линтер
+# этой связи не видит, потому что не следует за sourcing.
+# shellcheck disable=SC2034
+TT_RECORDS="${1:?usage: fetch-lists <records-file> <lists-dir>}"
+LISTS_DIR="${2:?missing lists dir}"
+
+TT_CURL="${TT_CURL:-curl}"
+TT_LISTS_BASE_URL="${TT_LISTS_BASE_URL:-https://raw.githubusercontent.com/itdoginfo/allow-domains/main}"
+
+tmp=$(mktemp -d) || exit 1
+_cur_tmp=""
+trap 'rm -rf "$tmp"; [ -n "$_cur_tmp" ] && rm -f "$_cur_tmp"' EXIT INT TERM
+
+rc=0
+
+# Сообщает о неудаче и поднимает код возврата только если откатываться некуда.
+# Проверяется именно ОБЫЧНЫЙ файл: guard от завершающего слэша ниже передаёт
+# сюда путь, оканчивающийся на "/", а `-s` на таком пути (каталог) может
+# оказаться истинным без единого байта настоящего списка внутри.
+_fail() {
+	printf 'fail %s\n' "$1"
+	[ -f "$2" ] && [ -s "$2" ] || rc=1
+}
+
+# fetch_one <url> <destination-relative-path>
+fetch_one() {
+	_url="$1"; _rel="$2"
+	_dst="$LISTS_DIR/$_rel"
+
+	# Относительный путь идёт прямиком из records (имя списка сообщества или
+	# basename своего URL) и становится файловым путём без проверки на выход
+	# за пределы LISTS_DIR. ".." или ведущий "/" превратили бы его в путь
+	# произвольного места на файловой системе.
+	case "$_rel" in
+		*..*|/*) _fail "$_rel" "$_dst"; return ;;
+	esac
+
+	# Схема URL проверяется здесь же: своя ссылка (lists.url) приходит от
+	# пользователя без проверки, и без этой проверки file:// добралось бы до
+	# curl и прочитало бы произвольный файл роутера как список.
+	case "$_url" in
+		http://*|https://*) ;;
+		*) _fail "$_rel" "$_dst"; return ;;
+	esac
+
+	# URL с завершающим слэшем даёт пустой basename, то есть путь-каталог
+	# вместо файла. Без этой проверки mv упал бы, а скрипт всё равно
+	# отрапортовал бы `ok`.
+	case "$_dst" in
+		*/) _fail "$_rel" "$_dst"; return ;;
+	esac
+
+	_dir=$(dirname "$_dst")
+	mkdir -p "$_dir" || { _fail "$_rel" "$_dst"; return; }
+
+	# Временный файл создаётся РЯДОМ с целью, а не в /tmp. На роутере /tmp это
+	# tmpfs, а списки лежат в оверлее, поэтому mv через границу файловых систем
+	# превратился бы в копирование — то есть перестал бы быть атомарным, и
+	# прерывание (пропало питание, сработал watchdog, убил OOM) оставило бы
+	# обрезанный файл вместо рабочего списка. Ровно от этого атомарная замена
+	# и защищает, так что временный файл обязан лежать на той же ФС.
+	_new=$(mktemp "$_dir/.tt-XXXXXX") || { _fail "$_rel" "$_dst"; return; }
+	_cur_tmp="$_new"
+
+	# --max-filesize защищает оверлей от списка-сироты, который заполнит всё
+	# свободное место: своя ссылка не обязана указывать на настоящий список
+	# доменов ограниченного размера.
+	if ! "$TT_CURL" -fsSL --max-time 60 --retry 2 --max-filesize 10485760 -o "$_new" "$_url" 2>/dev/null \
+			|| [ ! -s "$_new" ]; then
+		rm -f "$_new"; _cur_tmp=""
+		_fail "$_rel" "$_dst"
+		return
+	fi
+
+	if [ -s "$_dst" ] && cmp -s "$_new" "$_dst"; then
+		rm -f "$_new"; _cur_tmp=""
+		printf 'unchanged %s\n' "$_rel"
+		return
+	fi
+
+	# Код возврата mv проверяется: без этого любая неудача записи (нет места,
+	# нет прав, цель оказалась каталогом) выдавала бы ложный `ok`, а ложный
+	# успех хуже отказа — он гасит именно тот сигнал, ради которого скрипт и
+	# печатает отчёт.
+	if ! mv "$_new" "$_dst"; then
+		rm -f "$_new"; _cur_tmp=""
+		_fail "$_rel" "$_dst"
+		return
+	fi
+	_cur_tmp=""
+	printf 'ok %s\n' "$_rel"
+}
+
+for key in lists.source lists.subnet; do
+	tt_list "$key" > "$tmp/keys"
+	while IFS= read -r rel; do
+		[ -n "$rel" ] || continue
+		fetch_one "$TT_LISTS_BASE_URL/$rel" "$rel"
+	done < "$tmp/keys"
+done
+
+tt_list lists.url > "$tmp/urls"
+while IFS= read -r url; do
+	[ -n "$url" ] || continue
+	base=${url##*/}
+	fetch_one "$url" "custom/$base"
+done < "$tmp/urls"
+
+exit "$rc"

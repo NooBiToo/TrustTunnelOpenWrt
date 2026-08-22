@@ -1,0 +1,579 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=95
+STOP=10
+
+LIBDIR=/usr/libexec/trusttunnel
+OUTDIR=/var/etc/trusttunnel
+LISTSDIR=/usr/share/trusttunnel/lists
+RECORDS=$OUTDIR/settings.tsv
+CLIENT=/opt/trusttunnel_client/trusttunnel_client
+DOH_BIN=/usr/sbin/https-dns-proxy
+# Init-скрипт dnsmasq переопределяется из окружения по тому же образцу, что
+# TT_IP и TT_NFT в routing: иначе перезапуск и сброс кэша нельзя покрыть
+# тестами на машине разработчика, где dnsmasq нет вовсе, а именно от них
+# зависит, наполнятся ли наборы после routing up.
+TT_DNSMASQ_INIT="${TT_DNSMASQ_INIT:-/etc/init.d/dnsmasq}"
+
+# Выставляется link_dnsmasq, читается flush_dns_cache. Обычная переменная
+# процесса: обе функции вызываются в одном и том же вызове init-скрипта.
+_dnsmasq_restarted=0
+# Путь к conf-dir вычисляется во время работы функцией dnsmasq_confdir:
+# он зависит от имени секции dnsmasq в UCI, поэтому константой быть не может.
+
+# Клиент статически слинкован с BoringSSL и берёт хранилище доверия из
+# SSL_CERT_FILE. Ванильный OpenWrt без ca-bundle не имеет его вовсе.
+setup_trust_store() {
+	# Хранилище доверия не нужно в двух случаях: проверка сертификата
+	# отключена, либо сертификат endpoint закреплён в конфигурации. Раньше
+	# сообщение об ошибке обещало оба выхода, но код не реализовывал ни
+	# одного, и роутер без ca-bundle не мог подключиться даже к серверу с
+	# закреплённым самоподписанным сертификатом — то есть настройка
+	# skip_verification не работала вообще.
+	config_load trusttunnel
+	config_get_bool _skipver endpoint skip_verification 0
+	config_get _pinned endpoint certificate
+	if [ "$_skipver" = "1" ] || [ -n "$_pinned" ]; then
+		return 0
+	fi
+	for f in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt; do
+		if [ -s "$f" ]; then
+			export SSL_CERT_FILE="$f"
+			[ -d /etc/ssl/certs ] && export SSL_CERT_DIR=/etc/ssl/certs
+			return 0
+		fi
+	done
+	logger -t trusttunnel "error: no CA bundle found; install ca-bundle, pin a certificate, or disable verification"
+	return 1
+}
+
+# Сертификат проверяется по системным часам: до синхронизации NTP любой
+# сертификат выглядит ещё не действительным.
+wait_for_time() {
+	floor=$(date -r "$LIBDIR/gen-config" +%s 2>/dev/null) || floor=1750000000
+	waited=0
+	while [ "$(date +%s)" -lt "$floor" ] && [ "$waited" -lt 30 ]; do
+		sleep 2
+		waited=$((waited + 2))
+	done
+	# Молчаливый выход по таймауту делал бы отказ недиагностируемым: клиент
+	# отверг бы сертификат как «ещё не действительный», а в логе не было бы
+	# ничего, что указывало бы на часы.
+	if [ "$(date +%s)" -lt "$floor" ]; then
+		logger -t trusttunnel "warning: clock still behind install time; certificate validation may fail"
+	fi
+}
+
+wait_for_wan() {
+	waited=0
+	while [ "$waited" -lt 30 ]; do
+		[ -n "$(ip route show default 2>/dev/null)" ] && return 0
+		sleep 1
+		waited=$((waited + 1))
+	done
+	logger -t trusttunnel "warning: no default route after 30s"
+	return 0
+}
+
+regenerate() {
+	# Права выставляются umask, а не chmod после создания: иначе между
+	# созданием файла и chmod остаётся окно, в котором пароль endpoint и
+	# приватный сертификат читаемы всем.
+	umask 077
+	mkdir -p "$OUTDIR"
+	# Пишем во временный файл и переносим по успеху: `>` обрезает цель сразу,
+	# и отказ посреди записи (uci-export упал, кончилось место) уничтожил бы
+	# запись о применённом состоянии, из которой stop_service потом снимает
+	# маршрутизацию — снимать было бы уже нечего.
+	"$LIBDIR/uci-export" > "$RECORDS.new" || { rm -f "$RECORDS.new"; return 1; }
+	mv "$RECORDS.new" "$RECORDS"
+
+	extra=""
+	mode=$(awk -F'\t' '$1=="main.mode"{print $2; exit}' "$RECORDS")
+	[ -n "$mode" ] || mode=selective
+	full_ex=$(awk -F'\t' '$1=="main.full_exclude_lists"{print $2; exit}' "$RECORDS")
+
+	if [ "$mode" = "selective" ]; then
+		"$LIBDIR/gen-lists" "$RECORDS" "$LISTSDIR" "$OUTDIR" > "$OUTDIR/lists.summary" \
+			|| logger -t trusttunnel "warning: list generation failed"
+	else
+		rm -f "$OUTDIR/dnsmasq.conf" "$OUTDIR/elements.nft" "$OUTDIR/own.domains"
+		if [ "$full_ex" = "1" ]; then
+			# Домены выбранных списков отдаём клиенту как exclusions.
+			: > "$OUTDIR/exclusions.extra"
+			awk -F'\t' '$1=="lists.source"{print $2}' "$RECORDS" | while IFS= read -r rel; do
+				[ -f "$LISTSDIR/$rel" ] && cat "$LISTSDIR/$rel" >> "$OUTDIR/exclusions.extra"
+			done
+			"$LIBDIR/normalize" < "$OUTDIR/exclusions.extra" > "$OUTDIR/exclusions.norm" 2>/dev/null
+			mv "$OUTDIR/exclusions.norm" "$OUTDIR/exclusions.extra"
+			extra="$OUTDIR/exclusions.extra"
+		else
+			rm -f "$OUTDIR/exclusions.extra"
+		fi
+	fi
+
+	# Сертификат минует records (PEM многострочный) и передаётся файлом.
+	cert=""
+	cert_value=$(uci -q get trusttunnel.endpoint.certificate 2>/dev/null)
+	if [ -n "$cert_value" ]; then
+		printf '%s\n' "$cert_value" > "$OUTDIR/endpoint.pem"
+		chmod 600 "$OUTDIR/endpoint.pem"
+		cert="$OUTDIR/endpoint.pem"
+	else
+		rm -f "$OUTDIR/endpoint.pem"
+	fi
+
+	"$LIBDIR/gen-config" "$RECORDS" "$extra" "$cert" > "$OUTDIR/client.toml" || return 1
+	chmod 600 "$OUTDIR/client.toml"
+	return 0
+}
+
+# Каталог conf-dir у dnsmasq ПРОВЕРЕН на живом OpenWrt 25.12.5: это
+# /tmp/dnsmasq.<секция>.d (например /tmp/dnsmasq.cfg01411c.d), а каталога
+# /tmp/dnsmasq.d не существует вовсе. Файл, положенный в /tmp/dnsmasq.d, не
+# читался бы никогда, и селективный режим молча не делал бы ничего.
+#
+# Спрашиваем сначала работающий экземпляр — это авторитетный ответ. Если
+# dnsmasq не запущен, выводим имя секции через /lib/functions.sh тем же
+# способом, что и его init-скрипт. Через `uci show dhcp` этого делать нельзя:
+# для анонимной секции он отдаёт `@dnsmasq[0]`, а не настоящее имя.
+dnsmasq_confdir() {
+	_d=$(sed -n 's/^conf-dir=\([^,]*\).*/\1/p' /var/etc/dnsmasq.conf.* 2>/dev/null | head -1)
+	if [ -n "$_d" ]; then
+		printf '%s\n' "$_d"
+		return 0
+	fi
+	config_load dhcp
+	_cfg=""
+	_pick_dnsmasq() { [ -n "$_cfg" ] || _cfg="$1"; }
+	config_foreach _pick_dnsmasq dnsmasq
+	if [ -z "$_cfg" ]; then
+		printf '/tmp/dnsmasq.d\n'
+		return 0
+	fi
+	config_get _d "$_cfg" confdir "/tmp/dnsmasq.$_cfg.d"
+	printf '%s\n' "${_d%%,*}"
+}
+
+# ПРОВЕРЕНО на живом роутере: `/etc/init.d/dnsmasq reload` НЕ применяет новый
+# файл в conf-dir, а `restart` применяет. reload_service посылает SIGHUP, а тот
+# сбрасывает кэш, но не перечитывает ни conf-файлы, ни /etc/hosts. Насчёт hosts
+# проверено отдельно, потому что обратное утверждение встречается повсеместно:
+# записи вычищенного hosts-файла продолжали отдаваться и после HUP, а исчезли
+# только после restart — при том что внутри своего jail dnsmasq видел уже новый
+# файл. Сквозной тест по conf-dir: директива после reload давала NXDOMAIN, после
+# restart — нужный адрес. Поэтому здесь именно restart.
+#
+# Restart тяжелее reload, поэтому проверка «изменилось ли содержимое» тут
+# особенно важна: слепок последнего загруженного файла лежит рядом. После
+# перезагрузки роутера слепка нет, и первый старт перезапускает dnsmasq — это
+# верно.
+link_dnsmasq() {
+	_dnsmasq_restarted=0
+	if [ -f "$OUTDIR/dnsmasq.conf" ]; then
+		# Штатный dnsmasq на OpenWrt собирается с no-nftset и ПРОВЕРЕНО на
+		# живом роутере отвечает на такую директиву "recompile with
+		# HAVE_NFTSET defined" и завершается с ошибкой конфигурации. procd
+		# уходит в respawn, и LAN остаётся без резолвера и без DHCP — самый
+		# тяжёлый отказ, который этот пакет может произвести. Установщик
+		# только предлагает поставить dnsmasq-full и не принуждает к этому,
+		# поэтому здесь нужна собственная проверка перед публикацией файла.
+		if dnsmasq --version 2>/dev/null | grep -q 'no-nftset'; then
+			logger -t trusttunnel "error: this dnsmasq lacks nftset support; install dnsmasq-full or switch to \"everything through VPN\" mode"
+			unlink_dnsmasq
+			return 1
+		fi
+		_dir=$(dnsmasq_confdir)
+		mkdir -p "$_dir"
+		# КОПИЯ, а не символическая ссылка. dnsmasq на OpenWrt работает
+		# внутри ujail, куда /var/etc/trusttunnel не смонтирован, поэтому по
+		# ссылке он пройти не может. ПРОВЕРЕНО на живом роутере: с симлинком
+		# в логе «cannot access …/trusttunnel.conf: No such file or
+		# directory», «FAILED to start up», и procd уводит dnsmasq в crash
+		# loop — то есть установка пакета убивает DNS всей сети. С обычным
+		# файлом dnsmasq поднимается и наполняет сеты.
+		#
+		# Копия попутно снимает вопрос о правах на $OUTDIR: dnsmasq читает
+		# файл в своём каталоге, а наш остаётся закрытым вместе с паролем
+		# внутри.
+		# rm перед cp: если тут лежит СИМЛИНК от прежней версии пакета,
+		# указывающий на сам $OUTDIR/dnsmasq.conf, cp отказывается копировать
+		# файл на самого себя ("are the same file") с ненулевым кодом, ссылка
+		# остаётся висячей нигде не проверенной, и dnsmasq продолжает
+		# crash-loop'иться.
+		rm -f "$_dir/trusttunnel.conf"
+		cp "$OUTDIR/dnsmasq.conf" "$_dir/trusttunnel.conf"
+		chmod 644 "$_dir/trusttunnel.conf"
+		if [ ! -f "$OUTDIR/dnsmasq.loaded" ] \
+				|| ! cmp -s "$OUTDIR/dnsmasq.conf" "$OUTDIR/dnsmasq.loaded"; then
+			cp "$OUTDIR/dnsmasq.conf" "$OUTDIR/dnsmasq.loaded"
+			"$TT_DNSMASQ_INIT" restart >/dev/null 2>&1
+			_dnsmasq_restarted=1
+		fi
+	else
+		unlink_dnsmasq
+	fi
+}
+
+unlink_dnsmasq() {
+	# ВСЕГДА безусловна: её вызывают не только stop_service (см. ниже флаг
+	# _TT_RESTARTING, которым РЕШЕНИЕ ВЫЗЫВАТЬ управляет вызывающая сторона),
+	# но и link_dnsmasq — когда dnsmasq не умеет nftset, или когда режим стал
+	# full и файла для публикации больше нет. Оба этих случая — окончательное
+	# решение снять публикацию ПРЯМО СЕЙЧАС, а не «наверное, ничего не
+	# изменилось»; флаг внутри этой функции скрывал бы именно тот отказ,
+	# который эта же функция обязана предотвратить (см. link_dnsmasq).
+	_dir=$(dnsmasq_confdir)
+	# Проверяются и обычный файл, и ссылка: на роутере, обновлённом с версии,
+	# которая ставила симлинк, осталась бы висячая ссылка — а она валит
+	# dnsmasq. `-e` для висячей ссылки ложно, поэтому нужен и `-L`.
+	if [ -e "$_dir/trusttunnel.conf" ] || [ -L "$_dir/trusttunnel.conf" ]; then
+		rm -f "$_dir/trusttunnel.conf"
+		rm -f "$OUTDIR/dnsmasq.loaded"
+		"$TT_DNSMASQ_INIT" restart >/dev/null 2>&1
+		_dnsmasq_restarted=1
+	fi
+}
+
+# Сбрасывает кэш dnsmasq после того, как routing up пересоздал nft-таблицу.
+#
+# ЗАЧЕМ. `routing up` начинается с `delete table`, поэтому все адреса, которые
+# dnsmasq накопил в tt_bypass4/6, при каждом применении настроек пропадают.
+# Наполнить наборы заново может только dnsmasq, и только отвечая ОТ UPSTREAM:
+# ответ, выданный из его собственного кэша, в nftset НЕ попадает. ПРОВЕРЕНО на
+# живом роутере (OpenWrt 25.12.5, dnsmasq 2.93): после restart без правки
+# списков адрес из набора исчезал, а повторный запрос отвечал из кэша и набор
+# не восстанавливал. Клиент в это время бьёт по адресу, которого в наборе
+# больше нет, и уходит НАПРЯМУЮ — обход молча мёртв до истечения TTL, при том
+# что интерфейс показывает работающую службу и полные списки.
+#
+# HUP, а не restart: он сбрасывает кэш, не роняя DNS и DHCP всей сети.
+# Пропускается ровно тогда, когда link_dnsmasq уже сделал полный restart —
+# тот поднимает dnsmasq с пустым кэшем, и второй сброс был бы лишней работой
+# на пути, который и так самый тяжёлый.
+flush_dns_cache() {
+	[ "$_dnsmasq_restarted" = "1" ] && return 0
+	killall -HUP dnsmasq 2>/dev/null || true
+}
+
+# Просит warm-sets наполнить наборы адресами своих доменов, не дожидаясь
+# первого запроса клиента (зачем это нужно — в самом warm-sets).
+#
+# В ФОНЕ и это принципиально: warm-sets ждёт, пока dnsmasq снова начнёт
+# отвечать, до пятнадцати секунд после его перезапуска. procd запускает клиент
+# только ПОСЛЕ возврата из start_service, поэтому ожидание на переднем плане
+# задержало бы подъём туннеля ровно на время, которое нужно совсем другой
+# службе. Отказ прогрева ничего не ломает: наборы наполнятся лениво, как
+# наполнялись до его появления.
+warm_sets() {
+	[ -x "$LIBDIR/warm-sets" ] || return 0
+	"$LIBDIR/warm-sets" "$OUTDIR/own.domains" >/dev/null 2>&1 &
+}
+
+# Откатывает оптимизацию restart(), если start_service не смог дойти до
+# link_dnsmasq. Расчёт "unlink_dnsmasq в stop_service можно пропустить"
+# держится на том, что link_dnsmasq ниже подтвердит неизменность контента и
+# тоже промолчит. Если старт прерывается раньше этой точки по любой причине —
+# служба выключена, бинарника нет, не собрался конфиг, не поднялась
+# маршрутизация — этот расчёт не оправдался: routing down в stop_service уже
+# разобрал маршрутизацию и nft-таблицу, а директивы dnsmasq остались бы
+# нетронутыми и указывали бы на то, чего больше нет. Форсируем настоящую
+# чистку так же, как при обычном stop.
+abort_restart_cleanup() {
+	if [ "${_TT_RESTARTING:-0}" = "1" ]; then
+		_TT_RESTARTING=0
+		unlink_dnsmasq
+	fi
+}
+
+
+# Наибольший ifindex среди всех интерфейсов. ifindex монотонно растёт, поэтому
+# он — надёжный признак «появилось ПОСЛЕ этого момента», в отличие от имени.
+max_ifindex() {
+	_max=0
+	for _n in /sys/class/net/*; do
+		_i=$(cat "$_n/ifindex" 2>/dev/null) || continue
+		[ "$_i" -gt "$_max" ] 2>/dev/null && _max="$_i"
+	done
+	printf '%s\n' "$_max"
+}
+
+# Печатает НЕпостоянные tun-устройства с ifindex больше заданного.
+# Признак tun — наличие /sys/class/net/<dev>/tun_flags (проверено на живом
+# роутере: у tt0 и tun0 он есть, у br-lan нет). Бит IFF_PERSIST (0x800)
+# отсекает устройства, созданные вручную через `ip tuntap add`: клиент создаёт
+# своё без него.
+new_client_devices() {
+	_since="$1"
+	for _n in /sys/class/net/*; do
+		[ -e "$_n/tun_flags" ] || continue
+		_i=$(cat "$_n/ifindex" 2>/dev/null) || continue
+		[ "$_i" -gt "$_since" ] 2>/dev/null || continue
+		_f=$(cat "$_n/tun_flags" 2>/dev/null) || continue
+		[ "$(( _f & 0x800 ))" = "0" ] || continue
+		printf '%s\n' "${_n##*/}"
+	done
+}
+
+# Ждёт появления НОВОГО tun-устройства и привязывает к нему маршрут.
+# $1 — путь к файлу со снимком списка, снятым ДО старта клиента.
+#
+# Имя своего устройства клиент выбирает сам и настройкой не управляется,
+# поэтому единственный надёжный способ его узнать — сравнить список до и после.
+# Гадать по имени нельзя: tun0 может уже принадлежать другому VPN на этом же
+# роутере, и мы направили бы туннельный трафик в чужой интерфейс.
+#
+# Ожидание ограничено 30 секундами. Клиент поднимает устройство за доли секунды
+# после успешного подключения, но подключение может и не состояться — нет сети,
+# неверный адрес, отказ сервера. Бесконечное ожидание повесило бы start_service,
+# а отсутствие ожидания означало бы, что маршрут не поставится никогда. Пока
+# устройства нет, помеченный трафик держит blackhole, поставленный в do_up, —
+# то есть неудача здесь не открывает утечку, а оставляет killswitch включённым.
+# ОДНА попытка привязки, без ожидания.
+#
+# Здесь БЫЛ цикл ожидания на 30 секунд, и он не мог сработать никогда: procd
+# запускает процесс инстанса только ПОСЛЕ возврата из start_service, поэтому
+# внутри start_service клиента ещё не существует и создавать устройство некому.
+# Измерено на живом роутере: `/etc/init.d/trusttunnel start` занимал 31 секунду,
+# каждый запуск писал в журнал ложное предупреждение «клиент не создал
+# устройство», а настоящую привязку делал hotplug-скрипт.
+#
+# Основной механизм — /etc/hotplug.d/net/40-trusttunnel: он срабатывает ровно
+# тогда, когда устройство появляется, и покрывает как первый запуск, так и
+# пересоздание устройства после перезапуска клиента силами procd.
+#
+# Эта попытка нужна для краевого случая, когда подходящее устройство УЖЕ есть и
+# события add не будет: например служба перезапускается поверх ещё живого
+# клиента. Стоит она одну проверку sysfs.
+attach_client_device() {
+	_new=$(new_client_devices "$1" | head -n1)
+	[ -n "$_new" ] || return 0
+	"$LIBDIR/routing" attach "$RECORDS" "$OUTDIR" "$_new"
+}
+
+# Локальный DoH-прокси поднимается ОТДЕЛЬНЫМ экземпляром procd, а не через
+# чужой сервис: конфиг https-dns-proxy мы не трогаем, поэтому если у
+# пользователя уже есть свой экземпляр, он остаётся жить своей жизнью. Порт по
+# умолчанию 5460 выбран так, чтобы не столкнуться ни с ним (5053 у пакетного
+# init), ни со stubby (5453).
+#
+# Зависимости на пакет НЕТ намеренно: шифрованный DNS нужен не всем, а лишние
+# 400 КБ на роутере с 8 МБ флеша заметны. Если прокси не установлен, gen-lists
+# не выдаёт строки server= вовсе — домены резолвит провайдер, обход продолжает
+# работать, а диагностика говорит, что поставить.
+start_doh_proxy() {
+	_mode=$(awk -F'\t' '$1=="network.list_dns"{print $2; exit}' "$RECORDS" 2>/dev/null)
+	[ "$_mode" = "doh" ] || return 0
+
+	_url=$(awk -F'\t' '$1=="network.list_doh_url"{print $2; exit}' "$RECORDS" 2>/dev/null)
+	_port=$(awk -F'\t' '$1=="network.list_doh_port"{print $2; exit}' "$RECORDS" 2>/dev/null)
+	[ -n "$_port" ] || _port=5460
+
+	if [ -z "$_url" ]; then
+		logger -t trusttunnel "error: encrypted DNS is selected but no resolver URL is set; list domains fall back to the provider resolver"
+		return 1
+	fi
+	if [ ! -x "$DOH_BIN" ]; then
+		logger -t trusttunnel "error: encrypted DNS is selected but $DOH_BIN is missing; install https-dns-proxy. List domains fall back to the provider resolver"
+		return 1
+	fi
+
+	# Слушает ТОЛЬКО на 127.0.0.1: этот резолвер предназначен для dnsmasq на
+	# том же роутере, и выставлять его в сеть незачем.
+	procd_open_instance trusttunnel_doh
+	procd_set_param command "$DOH_BIN" -a 127.0.0.1 -p "$_port" -r "$_url"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+	logger -t trusttunnel "encrypted DNS proxy listening on 127.0.0.1:$_port"
+}
+
+start_service() {
+	config_load trusttunnel
+	config_get_bool enabled main enabled 0
+	[ "$enabled" = "1" ] || {
+		logger -t trusttunnel "disabled in configuration, not starting"
+		abort_restart_cleanup
+		return 0
+	}
+
+	[ -x "$CLIENT" ] || {
+		logger -t trusttunnel "error: $CLIENT not found; run install.sh"
+		abort_restart_cleanup
+		return 1
+	}
+
+	setup_trust_store || { abort_restart_cleanup; return 1; }
+	regenerate || {
+		logger -t trusttunnel "error: configuration generation failed"
+		abort_restart_cleanup
+		return 1
+	}
+
+	wait_for_wan
+	wait_for_time
+
+	"$LIBDIR/routing" up "$RECORDS" "$OUTDIR" || {
+		logger -t trusttunnel "error: routing setup failed"
+		abort_restart_cleanup
+		return 1
+	}
+	link_dnsmasq
+	flush_dns_cache
+	warm_sets
+
+	# Снимок tun-устройств СТРОГО до старта клиента: разница со списком после
+	# старта и даёт имя устройства, которое создал клиент.
+	# Отметка по ifindex СТРОГО до старта клиента. Сравнение по ИМЕНИ здесь не
+	# работает: при перезапуске устройство прежнего клиента ещё не исчезло в
+	# момент снимка — procd убивает процесс асинхронно, а устройство уходит
+	# вместе с ним, — поэтому «нового имени» не появлялось и ожидание отваливалось
+	# по таймауту. Проверено на живом роутере по журналу: предупреждение о
+	# таймауте и успешная привязка через hotplug приходили одной секундой.
+	# ifindex монотонно растёт, поэтому пересозданное устройство отличимо даже
+	# под тем же именем.
+	_tun_since=$(max_ifindex)
+
+	procd_open_instance trusttunnel
+	procd_set_param command "$CLIENT" -c "$OUTDIR/client.toml"
+	# Переменные передаются только если хранилище доверия действительно
+	# определено. При закреплённом сертификате или отключённой проверке
+	# setup_trust_store выходит рано, и пустой SSL_CERT_FILE сбивал бы
+	# BoringSSL вместо того чтобы просто отсутствовать.
+	if [ -n "$SSL_CERT_FILE" ]; then
+		# SSL_CERT_DIR передаётся ТОЛЬКО когда непусто — тот же риск, что
+		# соседний комментарий описывает для SSL_CERT_FILE: пустое значение
+		# переменной окружения для BoringSSL не то же самое, что отсутствие
+		# переменной, и может сбить поиск хранилища доверия вместо того чтобы
+		# просто не участвовать в нём.
+		if [ -n "${SSL_CERT_DIR:-}" ]; then
+			procd_set_param env SSL_CERT_FILE="$SSL_CERT_FILE" SSL_CERT_DIR="$SSL_CERT_DIR"
+		else
+			procd_set_param env SSL_CERT_FILE="$SSL_CERT_FILE"
+		fi
+	fi
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile /var/run/trusttunnel.pid
+	procd_close_instance
+
+	start_doh_proxy
+
+	# Привязка к устройству клиента — задача hotplug-скрипта: procd запускает
+	# процесс только ПОСЛЕ возврата отсюда, поэтому дожидаться устройства здесь
+	# бессмысленно (см. комментарий у attach_client_device). Этот вызов лишь
+	# покрывает случай уже существующего устройства и не ждёт.
+	attach_client_device "$_tun_since" || true
+}
+
+stop_service() {
+	# restart() ставит _TT_RESTARTING перед stop+start. Между stop_service и
+	# start_service публикуемое содержимое dnsmasq.conf не меняется (та же
+	# UCI-конфигурация), так что снимать файл и перезапускать dnsmasq здесь,
+	# только чтобы start_service подняла его снова несколько секунд позже —
+	# два лишних restart на простое сохранение настроек или флап WAN, и в
+	# промежутке LAN на секунды без резолвера. Поэтому вызов unlink_dnsmasq
+	# здесь пропускается, а не сама функция становится условной: link_dnsmasq
+	# вызывает unlink_dnsmasq и для окончательных решений (dnsmasq не умеет
+	# nftset; режим стал full) — там пропуск был бы уже неверен, поэтому
+	# условие стоит только у ЭТОГО вызова.
+	if [ "${_TT_RESTARTING:-0}" != "1" ]; then
+		unlink_dnsmasq
+	fi
+	[ -f "$OUTDIR/settings.tsv" ] && "$LIBDIR/routing" down "$OUTDIR/settings.tsv"
+	return 0
+}
+
+# Переопределяет generic restart() из /etc/rc.common (stop; start), чтобы
+# отметить намерение до вызова unlink_dnsmasq внутри stop_service. Между
+# остановкой и запуском публикуемое содержимое dnsmasq.conf идентично (та же
+# UCI-конфигурация), так что верное число restart-ов dnsmasq на цикл
+# stop+start — ноль, а не два. Флаг — обычная переменная процесса: restart(),
+# stop() и start() выполняются в одном и том же вызове init-скрипта, поэтому
+# она видна всем троим без export.
+restart() {
+	# trap '' TERM — как в generic restart() из /etc/rc.common: этот
+	# процесс часто запускается отдельно (триггер интерфейса, cron, Save &
+	# Apply), и TERM, полученный посреди stop+start, не должен обрывать
+	# восстановление маршрутизации и клиента на середине.
+	trap '' TERM
+	_TT_RESTARTING=1
+	stop "$@"
+	start "$@"
+}
+
+reload_service() {
+	restart
+}
+
+service_triggers() {
+	procd_add_reload_trigger "trusttunnel"
+	procd_add_interface_trigger "interface.*.up" wan /etc/init.d/trusttunnel restart
+}
+
+# Ручное обновление списков: скачать и перегенерировать без разрыва туннеля.
+update_lists() {
+	# Тот же umask, что в regenerate: records содержит пароль endpoint, и
+	# создавать его под системным umask значило бы оставить пароль читаемым
+	# всем — ровно та экспозиция, которую regenerate уже закрыл.
+	umask 077
+	mkdir -p "$OUTDIR" "$LISTSDIR"
+	"$LIBDIR/uci-export" > "$RECORDS.new" || { rm -f "$RECORDS.new"; return 1; }
+	mv "$RECORDS.new" "$RECORDS"
+	"$LIBDIR/fetch-lists" "$RECORDS" "$LISTSDIR"
+	rc=$?
+	mode=$(awk -F'\t' '$1=="main.mode"{print $2; exit}' "$RECORDS")
+	if [ "${mode:-selective}" = "selective" ]; then
+		"$LIBDIR/gen-lists" "$RECORDS" "$LISTSDIR" "$OUTDIR" > "$OUTDIR/lists.summary" || return 1
+		# К ядру применяем только при включённой службе. Иначе ночной cron
+		# поднимал бы tt0, ip rule, nft-таблицу и blackhole-маршрут без
+		# запущенного клиента: помеченный трафик LAN к доменам из списков
+		# уходил бы в никуда каждую ночь, при том что интерфейс показывает
+		# выключенный обход. Такой отказ невозможно диагностировать.
+		config_load trusttunnel
+		config_get_bool _en main enabled 0
+		if [ "$_en" = "1" ]; then
+			# Сброс кэша нужен ПОСЛЕ link_dnsmasq, а не до: только она
+			# знает, обошлось ли дело полным перезапуском dnsmasq, при
+			# котором кэш и так пуст. Обычный исход ночного cron — списки
+			# те же, dnsmasq не перезапущен, наборы обнулены; без сброса
+			# обход деградировал бы на всё утро, пока кэш не истечёт сам.
+			if "$LIBDIR/routing" up "$RECORDS" "$OUTDIR"; then
+				_up_ok=1
+			else
+				_up_ok=0
+			fi
+			link_dnsmasq
+			if [ "$_up_ok" = "1" ]; then
+				flush_dns_cache
+				warm_sets
+			fi
+		fi
+	fi
+	# Метка ставится только по успеху: иначе интерфейс показывал бы свежее
+	# «обновлено» для попытки, которая на самом деле провалилась.
+	# Метка времени пишется рядом со СПИСКАМИ, на постоянную память, а не в
+	# $OUTDIR: тот лежит в /var, а /var на OpenWrt — символическая ссылка на
+	# /tmp, то есть tmpfs. Проверено на живом роутере после перезагрузки: сами
+	# списки сохранялись, а метка исчезала, и интерфейс показывал «никогда»
+	# после каждого ребута — при том что данные актуальны.
+	[ "$rc" = "0" ] && date +%s > "$LISTSDIR/../lists.updated"
+	return "$rc"
+}
+
+# Точка входа для cron: уважает флаг автообновления. Кнопка «Обновить сейчас»
+# в интерфейсе вызывает update_lists напрямую, потому что явное действие
+# пользователя не должно зависеть от настройки расписания.
+update_lists_cron() {
+	config_load trusttunnel
+	config_get_bool _auto lists auto_update 1
+	[ "$_auto" = "1" ] || return 0
+	update_lists
+}
+
+EXTRA_COMMANDS="update_lists update_lists_cron"
+EXTRA_HELP="	update_lists	Download the selected lists and regenerate the rules
+	update_lists_cron	Same, but only when automatic updates are enabled"

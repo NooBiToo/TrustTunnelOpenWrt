@@ -1,0 +1,144 @@
+#!/bin/sh
+# Заводит зону фаервола для tun-устройства клиента и задание обновления списков.
+# Идемпотентно: повторный запуск ничего не дублирует.
+
+# Библиотека OpenWrt, на машине линтера отсутствует.
+# shellcheck disable=SC1091
+. /lib/functions.sh
+
+zone_exists=""
+# Переменная с префиксом `_`, а не `local`: `local` не входит в POSIX, и
+# `shellcheck -s sh` сообщает об этом (SC3043) с ненулевым кодом возврата,
+# роняя CI на первом же push. Остальные наши скрипты по той же причине
+# используют `_`-переменные, так что здесь это ещё и единообразно.
+# Вызывается через config_foreach, а _zname присваивает config_get из
+# библиотеки OpenWrt — ни того, ни другого линтер статически не видит.
+# shellcheck disable=SC2329,SC2317,SC2154
+find_zone() {
+	config_get _zname "" name
+	[ "$_zname" = "trusttunnel" ] && zone_exists=1
+}
+config_load firewall
+config_foreach find_zone zone
+
+if [ -z "$zone_exists" ]; then
+	z=$(uci add firewall zone)
+	uci set firewall."$z".name='trusttunnel'
+	uci set firewall."$z".input='REJECT'
+	uci set firewall."$z".output='ACCEPT'
+	uci set firewall."$z".forward='REJECT'
+	uci set firewall."$z".masq='1'
+	uci set firewall."$z".mtu_fix='1'
+	# Шаблон, а не конкретное имя: устройство создаёт КЛИЕНТ и выбирает имя
+	# сам (tun0, дальше по возрастанию), настройкой это не управляется. Зона,
+	# привязанная к нашему прежнему tt0, не покрывала бы устройство клиента
+	# вовсе — форвардинг в туннель отбрасывался бы фаерволом. Синтаксис `tun+`
+	# общепринят для зон OpenWrt: так же устроены конфигурации OpenVPN.
+	#
+	# Побочный эффект осознанный: зона накроет и чужие tun-устройства, если на
+	# роутере есть другой VPN. Альтернатива — переписывать зону при каждом
+	# запуске службы и перезагружать фаервол, что дороже и заметнее.
+	uci add_list firewall."$z".device='tun+'
+
+	f=$(uci add firewall forwarding)
+	uci set firewall."$f".src='lan'
+	uci set firewall."$f".dest='trusttunnel'
+
+	uci commit firewall
+	# Без reload зона и правило forwarding остаются только в UCI: tt0 не
+	# принадлежит ни одной зоне до следующей перезагрузки, форвардинг в
+	# туннель отбрасывается, а страница состояния при этом показывает
+	# устройство, правило, таблицу и nft как исправные — зелёное на сломанном
+	# сразу после установки.
+	/etc/init.d/firewall reload >/dev/null 2>&1
+fi
+
+# Миграция уже установленных роутеров. Зона, созданная прежней версией, привязана
+# к устройству tt0, которое мы больше не создаём: устройство теперь принадлежит
+# клиенту и называется иначе. Без этой правки после обновления зона не покрывает
+# ни одного живого интерфейса, форвардинг в туннель отбрасывается фаерволом, а
+# страница состояния показывает устройство, правило, таблицу и nft исправными —
+# то самое «зелёное на сломанном», от которого мы избавлялись весь проект.
+#
+# Блок выше не сработает: он выполняется только когда зоны ещё нет.
+# Тот же случай: вызов через config_foreach, присваивание через config_get.
+# shellcheck disable=SC2329,SC2317,SC2154
+migrate_zone_device() {
+	config_get _zn "" name
+	[ "$_zn" = "trusttunnel" ] || return 0
+	_devs=$(uci -q get "firewall.$1.device" 2>/dev/null)
+	case " $_devs " in
+		*" tun+ "*) return 0 ;;
+	esac
+	uci -q delete "firewall.$1.device"
+	uci add_list "firewall.$1.device"='tun+'
+	zone_migrated=1
+}
+
+if [ -n "$zone_exists" ]; then
+	zone_migrated=""
+	config_foreach migrate_zone_device zone
+	if [ -n "$zone_migrated" ]; then
+		uci commit firewall
+		/etc/init.d/firewall reload >/dev/null 2>&1
+		logger -t trusttunnel "firewall zone migrated from tt0 to the tun+ wildcard"
+	fi
+fi
+
+
+# Миграция настройки DNS. Прежде это была пара «флаг tunnel_list_dns + адрес»,
+# которые могли противоречить друг другу; теперь одно поле list_dns с тремя
+# значениями. Без переноса обновлённый роутер получил бы list_dns по умолчанию
+# (plain) и молча сменил бы поведение тому, кто сознательно выключил свой
+# резолвер флагом.
+if [ -z "$(uci -q get trusttunnel.network.list_dns)" ]; then
+	_old=$(uci -q get trusttunnel.network.tunnel_list_dns)
+	if [ "$_old" = "0" ]; then
+		uci set trusttunnel.network.list_dns='provider'
+	else
+		uci set trusttunnel.network.list_dns='plain'
+	fi
+	uci -q delete trusttunnel.network.tunnel_list_dns
+	uci commit trusttunnel
+	logger -t trusttunnel "migrated tunnel_list_dns to list_dns=$(uci -q get trusttunnel.network.list_dns)"
+fi
+
+mkdir -p /usr/share/trusttunnel/lists /var/cache/trusttunnel
+
+# Ежедневное обновление списков в 04:17 — время смещено от круглого часа,
+# чтобы не бить в GitHub вместе со всеми.
+mkdir -p /etc/crontabs
+[ -f /etc/crontabs/root ] || : > /etc/crontabs/root
+
+# Миграция со старой строки, вызывавшей update_lists напрямую, минуя флаг
+# автообновления. Проверять надо точное имя действия: подстрока
+# `trusttunnel update_lists` совпадает и со старым вариантом, поэтому
+# наивная проверка сочла бы старую строку за уже настроенную и оставила бы
+# обновлённый роутер навсегда с вызовом в обход флага. Пробел в конце
+# шаблона отличает старое действие от нового, поэтому sed идемпотентен.
+sed -i 's|trusttunnel update_lists |trusttunnel update_lists_cron |' /etc/crontabs/root
+
+if ! grep -q 'trusttunnel update_lists_cron' /etc/crontabs/root; then
+	echo '17 4 * * * /etc/init.d/trusttunnel update_lists_cron >/dev/null 2>&1' >> /etc/crontabs/root
+	/etc/init.d/cron enable >/dev/null 2>&1
+	/etc/init.d/cron restart >/dev/null 2>&1
+fi
+
+
+# Регистрация init-скрипта в загрузке. БЕЗ ЭТОГО туннель не поднимается после
+# перезагрузки роутера вообще: проверено на живом железе — после ребута в
+# /etc/rc.d/ не было ссылки, в журнале ни одной записи, служба не запускалась.
+#
+# Легко спутать два разных «включено», и именно на этом дефект и держался:
+# флажок «Включить» в интерфейсе выставляет trusttunnel.main.enabled, а это
+# всего лишь проверка ВНУТРИ start_service. За автозапуск отвечает ссылка в
+# rc.d, и её не создавал никто.
+#
+# Скрипт регистрируется ВСЕГДА, независимо от main.enabled: start_service сам
+# выходит в начале, если флаг снят, и пишет об этом в журнал. Так одно решение
+# («стартовать ли») остаётся в одном месте, а не размазывается по двум
+# механизмам с разной семантикой.
+/etc/init.d/trusttunnel enable >/dev/null 2>&1
+
+rm -f /tmp/luci-indexcache /tmp/luci-modulecache/* 2>/dev/null
+exit 0

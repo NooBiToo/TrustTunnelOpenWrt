@@ -1,0 +1,60 @@
+#!/bin/sh
+# Выгружает UCI-конфиг trusttunnel в records-формат на stdout.
+# Схема перечислена явно: так в records не попадает мусор из чужих правок.
+#
+# `set -u` здесь НЕ ставится и не должен возвращаться. ПРОВЕРЕНО на живом
+# роутере: /lib/functions.sh читает неинициализированные переменные — первой
+# IPKG_INSTROOT, затем CONFIG_LIST_STATE внутри config_load — и под `set -u`
+# скрипт падает молча, без вывода единой записи. Это первый шаг старта
+# службы, так что служба вообще не стартует. Библиотека несовместима с этим
+# режимом целиком, а не в каком-то одном месте: предварительная инициализация
+# переменных по одной не помогает, потому что новые необъявленные ссылки
+# появляются глубже по мере выполнения config_load/config_get.
+
+# Библиотека OpenWrt, на машине линтера отсутствует.
+# shellcheck disable=SC1091
+. /lib/functions.sh
+config_load trusttunnel
+
+_emit_one() { printf '%s\t%s\n' "$_KEY" "$1"; }
+
+scalar() {
+	config_get _v "$1" "$2"
+	[ -n "${_v:-}" ] && printf '%s\t%s\n' "$1.$2" "$_v"
+	return 0
+}
+
+listopt() {
+	_KEY="$1.$2"
+	config_list_foreach "$1" "$2" _emit_one
+	return 0
+}
+
+for o in enabled mode full_exclude_lists log_level; do scalar main "$o"; done
+# endpoint.certificate намеренно НЕ выгружается: PEM многострочный, а значение
+# в records не может содержать перевод строки. Сертификат пишет в отдельный
+# файл init-скрипт и передаёт его gen-config третьим аргументом.
+for o in hostname username password protocol anti_dpi post_quantum \
+		skip_verification has_ipv6; do
+	scalar endpoint "$o"
+done
+listopt endpoint address
+listopt endpoint dns_upstream
+
+# Опции "device" здесь БОЛЬШЕ НЕТ: имя устройства выбирает клиент, такой
+# настройки не существует. "tunnel_list_dns" заменён на "list_dns": флаг
+# «включать ли свой резолвер» и тип резолвера могли противоречить друг другу,
+# теперь это одно поле с тремя значениями — provider, plain, doh.
+for o in mtu table fwmark blackhole_on_down include_router_traffic \
+		intercept_dns list_dns list_resolver list_doh_url list_doh_port \
+		lan_devices; do
+	scalar network "$o"
+done
+
+for o in auto_update update_interval; do scalar lists "$o"; done
+listopt lists source
+listopt lists subnet
+listopt lists url
+
+listopt domains bypass
+listopt domains direct

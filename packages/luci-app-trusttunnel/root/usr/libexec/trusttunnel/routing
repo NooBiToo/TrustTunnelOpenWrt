@@ -1,0 +1,363 @@
+#!/bin/sh
+# Управляет таблицей маршрутизации, правилом по отметке и nft-таблицей
+# trusttunnel. Само tun-устройство НЕ создаёт: его создаёт клиент, а мы
+# привязываем к нему маршрут по умолчанию отдельной командой attach.
+# Использование:
+#   routing dump     <records-file>
+#   routing up       <records-file> <out-dir>
+#   routing attach   <records-file> <out-dir> <device>
+#   routing reattach <records-file> <out-dir>
+#   routing detach   <records-file> <out-dir>
+#   routing down     <records-file>
+#   routing status   <records-file> <out-dir>
+set -u
+
+TT_LIBDIR="${TT_LIBDIR:-$(dirname "$0")}"
+# Путь вычисляется во время работы, статически линтеру его не разрешить.
+# shellcheck disable=SC1091
+. "$TT_LIBDIR/records.sh"
+
+TT_IP="${TT_IP:-ip}"
+TT_NFT="${TT_NFT:-nft}"
+
+PRIO=30820
+PRIVATE4="10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4"
+PRIVATE6="::1/128, fc00::/7, fe80::/10, ff00::/8"
+
+cmd="${1:-}"
+TT_RECORDS="${2:-}"
+OUT_DIR="${3:-/var/etc/trusttunnel}"
+[ -n "$TT_RECORDS" ] || { echo "routing: missing records file" >&2; exit 1; }
+
+TABLE=$(tt_get network.table 880)
+MARK=$(tt_get network.fwmark 0x9527)
+MODE=$(tt_get main.mode selective)
+ROUTER_TRAFFIC=$(tt_bool network.include_router_traffic 0)
+BLACKHOLE=$(tt_bool network.blackhole_on_down 1)
+INTERCEPT_DNS=$(tt_bool network.intercept_dns 0)
+# Значение проверено на числовое ДО того как дойдёт до `ip`: `ip link set
+# mtu <мусор>` не тот отказ, который стоит обнаруживать на живом устройстве.
+MTU=$(tt_get network.mtu 1350)
+case "$MTU" in
+	''|*[!0-9]*) MTU=1350 ;;
+esac
+
+# Список LAN-интерфейсов в виде nft-множества: "br-lan", "br-guest"
+lan_set() {
+	_devs=$(tt_get network.lan_devices)
+	if [ -z "$_devs" ] && [ "$cmd" != "dump" ]; then
+		_devs=$(uci -q get network.lan.device 2>/dev/null)
+	fi
+	[ -n "$_devs" ] || _devs="br-lan"
+	printf '%s\n' "$_devs" | tr ' ' '\n' | awk '
+		NF { items[n++] = "\"" $0 "\"" }
+		END {
+			out = ""
+			for (i = 0; i < n; i++) out = out (i ? ", " : "") items[i]
+			printf "{ %s }", out
+		}
+	'
+}
+
+mark_rules() {
+	if [ "$MODE" = "selective" ]; then
+		printf '\t\tip daddr @tt_bypass4 meta mark set %s\n' "$MARK"
+		printf '\t\tip6 daddr @tt_bypass6 meta mark set %s\n' "$MARK"
+	else
+		printf '\t\tmeta mark set %s\n' "$MARK"
+	fi
+}
+
+common_returns() {
+	printf '\t\tip daddr @tt_endpoint4 return\n'
+	printf '\t\tip6 daddr @tt_endpoint6 return\n'
+	printf '\t\tip daddr { %s } return\n' "$PRIVATE4"
+	printf '\t\tip6 daddr { %s } return\n' "$PRIVATE6"
+}
+
+# Набор собирается последовательными printf, а НЕ heredoc с $(...) внутри.
+# Подстановка команд срезает завершающие переводы строки, из-за чего последний
+# `return` склеивался бы с правилом маркировки, а правило — с закрывающей
+# скобкой цепочки. nftables такой файл отвергает целиком: после терминального
+# вердикта `return` продолжение statement'ов — синтаксическая ошибка. Ассерты
+# на подстроки этого не видят, потому что подстроки остаются на месте.
+dump_ruleset() {
+	# Пустое объявление плюс delete делает пересоздание идемпотентным:
+	# без него delete падает на первой установке.
+	printf 'table inet trusttunnel { }\n'
+	printf 'delete table inet trusttunnel\n'
+	printf '\n'
+	printf 'table inet trusttunnel {\n'
+	printf '\tset tt_endpoint4 { type ipv4_addr; flags interval; }\n'
+	printf '\tset tt_endpoint6 { type ipv6_addr; flags interval; }\n'
+	# auto-merge — иначе nftables отказывается принять элемент, пересекающийся
+	# с уже существующим интервалом, и `nft -f` откатывает ВЕСЬ файл целиком
+	# одной транзакцией: две выбранные подсети-списка, у которых есть общий
+	# CIDR (обычное дело для этих данных), выбивали бы все элементы, а не
+	# только пересекающиеся. Сеты endpoint не трогаем: пересечение там
+	# означает ошибку конфигурации, а не нормальные пересекающиеся списки.
+	printf '\tset tt_bypass4 { type ipv4_addr; flags interval; auto-merge; }\n'
+	printf '\tset tt_bypass6 { type ipv6_addr; flags interval; auto-merge; }\n'
+	printf '\n'
+	printf '\tchain prerouting {\n'
+	printf '\t\ttype filter hook prerouting priority mangle; policy accept;\n'
+	printf '\t\tiifname != %s return\n' "$(lan_set)"
+	common_returns
+	mark_rules
+	printf '\t}\n'
+
+	if [ "$ROUTER_TRAFFIC" = "true" ]; then
+		printf '\n'
+		printf '\tchain output {\n'
+		printf '\t\ttype route hook output priority mangle; policy accept;\n'
+		# Шаблон, а НЕ конкретное имя: устройство создаёт клиент уже после
+		# того, как эти правила загружены, и на момент dump его имени ещё не
+		# существует. Смысл строки — не помечать повторно то, что уже уходит
+		# в туннель (иначе петля), и для этого шаблон подходит даже точнее
+		# конкретного имени: он покрывает и устройство, пересозданное клиентом
+		# под другим номером после перезапуска. Проверено на живом nftables
+		# 1.1.6: `oifname "tun*"` принимается.
+		printf '\t\toifname "tun*" return\n'
+		common_returns
+		mark_rules
+		printf '\t}\n'
+	fi
+
+	# Перехват клиентского DNS осмыслен только в селективном режиме: там
+	# сопоставление по спискам держится на ответах роутерного dnsmasq.
+	# В полном режиме весь трафик и так уходит в туннель.
+	if [ "$INTERCEPT_DNS" = "true" ] && [ "$MODE" = "selective" ]; then
+		printf '\n'
+		printf '\tchain dns_redirect {\n'
+		printf '\t\ttype nat hook prerouting priority dstnat; policy accept;\n'
+		printf '\t\tiifname != %s return\n' "$(lan_set)"
+		printf '\t\tmeta l4proto { tcp, udp } th dport 53 redirect to :53\n'
+		printf '\t}\n'
+		printf '\n'
+		printf '\tchain dns_block {\n'
+		printf '\t\ttype filter hook forward priority filter; policy accept;\n'
+		printf '\t\tiifname != %s return\n' "$(lan_set)"
+		printf '\t\tmeta l4proto { tcp, udp } th dport 853 reject\n'
+		printf '\t}\n'
+	fi
+	printf '}\n'
+}
+
+# Печатает IP-адреса хоста, по одному на строку.
+resolve_host() {
+	case "$1" in
+		*:*) printf '%s\n' "$1"; return ;;
+	esac
+	case "$1" in
+		[0-9]*)
+			if printf '%s' "$1" | grep -q '^[0-9][0-9.]*$'; then
+				printf '%s\n' "$1"; return
+			fi
+			;;
+	esac
+	# Формат ПРОВЕРЕН на живом OpenWrt 25.12.5 с busybox 1.37: секция ответа
+	# выглядит как `Address: 8.47.69.0` — БЕЗ номера. Прежний шаблон
+	# `^Address [0-9]+:` не совпадал ни с одной строкой, поэтому tt_endpoint
+	# оставался пустым, правило возврата на endpoint не срабатывало и
+	# соединение клиента к своему серверу уходило в собственный туннель, то
+	# есть туннель не поднимался вообще.
+	#
+	# Номер сделан опциональным, чтобы принимать и старый формат
+	# `Address 1: ip alias`. Хвост после адреса отсекается, а порт НЕ
+	# отсекается: у IPv6 это срезало бы последний групповой блок. Гейт по
+	# `Name:` отбрасывает блок самого резолвера, который печатается раньше
+	# секции ответа в виде `Address:\t127.0.0.1:53`.
+	nslookup "$1" 2>/dev/null | awk '
+		/^Name:/ { inanswer = 1; next }
+		inanswer {
+			line = $0
+			if (sub(/^Address[ \t]*[0-9]*:[ \t]*/, "", line)) {
+				sub(/[ \t].*$/, "", line)
+				if (line != "") print line
+			}
+		}
+	'
+}
+
+# Превращает endpoint.address (host:port или [v6]:port) в имя хоста.
+host_of() {
+	case "$1" in
+		\[*\]:*) printf '%s\n' "$1" | sed -e 's/^\[//' -e 's/\]:.*$//' ;;
+		*:*:*)   printf '%s\n' "$1" ;;
+		*:*)     printf '%s\n' "${1%:*}" ;;
+		*)       printf '%s\n' "$1" ;;
+	esac
+}
+
+# Печатает резолвнутые адреса endpoint.address, по одному на строку. НЕ
+# трогает nft вообще — вызывается до загрузки правил маркировки, см. do_up.
+resolve_endpoints() {
+	tt_list endpoint.address | while IFS= read -r addr; do
+		[ -n "$addr" ] || continue
+		resolve_host "$(host_of "$addr")"
+	done
+}
+
+# add_endpoint_elements <file-with-resolved-ips>
+# Классификация v4/v6 та же, что была в исходном fill_endpoint_sets: по
+# наличию двоеточия в адресе.
+add_endpoint_elements() {
+	while IFS= read -r ip; do
+		[ -n "$ip" ] || continue
+		case "$ip" in
+			*:*) $TT_NFT add element inet trusttunnel tt_endpoint6 "{ $ip }" 2>/dev/null ;;
+			*)   $TT_NFT add element inet trusttunnel tt_endpoint4 "{ $ip }" 2>/dev/null ;;
+		esac
+	done < "$1"
+}
+
+# Файл с именем устройства, которое создал КЛИЕНТ. Имя не наше и настройкой не
+# управляется: клиент выбирает его сам (tun0, дальше по возрастанию). Пишется
+# при attach, читается status и detach — иначе после перезапуска rpcd или
+# init-скрипта никто не знает, какое устройство обслуживать.
+DEVFILE="$OUT_DIR/device"
+
+client_device() {
+	[ -f "$DEVFILE" ] || return 1
+	_d=$(cat "$DEVFILE" 2>/dev/null)
+	[ -n "$_d" ] || return 1
+	# Устройство могло исчезнуть вместе с упавшим клиентом: имя без живого
+	# устройства хуже отсутствия имени, потому что status показывал бы
+	# работающий туннель по устаревшей записи.
+	$TT_IP link show dev "$_d" >/dev/null 2>&1 || return 1
+	printf '%s' "$_d"
+}
+
+do_attach() {
+	_dev="$1"
+	[ -n "$_dev" ] || { echo "routing: attach requires a device name" >&2; return 1; }
+	$TT_IP link show dev "$_dev" >/dev/null 2>&1 || {
+		logger -t trusttunnel "error: attach: device $_dev does not exist"
+		return 1
+	}
+	# Маршрут по умолчанию — metric 1, то есть строго ВЫШЕ blackhole (1000),
+	# который do_up поставил заранее. Пока устройства клиента нет, помеченный
+	# трафик упирается в blackhole; как только оно появилось, его перекрывает
+	# этот маршрут. Обратный порядок дал бы окно утечки.
+	$TT_IP route replace default dev "$_dev" table "$TABLE" metric 1 || return 1
+	$TT_IP -6 route replace default dev "$_dev" table "$TABLE" metric 1 2>/dev/null || true
+	mkdir -p "$OUT_DIR"
+	printf '%s\n' "$_dev" > "$DEVFILE"
+	logger -t trusttunnel "routing attached to client device $_dev"
+}
+
+
+# Повторная привязка по уже записанному имени. Нужна там, где правила
+# пересоздаются на ходу (обновление списков): сам маршрут при этом выживает,
+# потому что do_up делает `route replace`, а не flush, но полагаться на это
+# молча не стоит — вызов идемпотентен и стоит одну команду.
+do_reattach() {
+	_d=$(client_device) || return 0
+	do_attach "$_d"
+}
+do_detach() {
+	# Маршрут снимается, а blackhole остаётся: пока служба считается
+	# работающей, помеченный трафик не должен уходить в основную таблицу.
+	$TT_IP route del default table "$TABLE" metric 1 2>/dev/null || true
+	$TT_IP -6 route del default table "$TABLE" metric 1 2>/dev/null || true
+	rm -f "$DEVFILE"
+}
+
+do_up() {
+	# Устройство ЗДЕСЬ НЕ СОЗДАЁТСЯ. Первоначальный замысел был обратным:
+	# роутер создаёт tun-устройство, а клиент присоединяется к нему через
+	# `device_name` + `use_existing` в client.toml. Таких ключей в схеме
+	# клиента НЕ СУЩЕСТВУЕТ — проверено против эталона, который генерирует
+	# сам setup_wizard: в [listener.tun] есть bound_if (совсем другое
+	# назначение — интерфейс для исходящих соединений), included_routes,
+	# excluded_routes, mtu_size, change_system_dns. Наши ключи клиент молча
+	# игнорировал и создавал СВОЁ устройство, а созданное нами оставалось без
+	# носителя. Маршрут в таблице указывал на мёртвое устройство, помеченный
+	# трафик отбрасывался, и при этом check_domain отвечал "verdict: tunnel".
+	# Поэтому маршрут по умолчанию ставится отдельной командой `attach` —
+	# после старта клиента, на устройство, которое создал ОН.
+	#
+	# blackhole ставится здесь и намеренно раньше attach: до появления
+	# устройства клиента помеченный трафик должен упираться в него, а не
+	# утекать в основную таблицу.
+	if [ "$BLACKHOLE" = "true" ]; then
+		$TT_IP route replace blackhole default table "$TABLE" metric 1000
+		$TT_IP -6 route replace blackhole default table "$TABLE" metric 1000
+	fi
+
+	# Якорь "([^0-9]|$)" после номера таблицы: без него правило для чужой
+	# таблицы "8800" совпало бы по подстроке с "lookup 880" и подавило бы
+	# создание НАШЕГО правила — помеченный трафик утекал бы в основную
+	# таблицу маршрутизации.
+	$TT_IP rule show | grep -qE "lookup $TABLE([^0-9]|\$)" \
+		|| $TT_IP rule add fwmark "$MARK" table "$TABLE" priority "$PRIO"
+	$TT_IP -6 rule show | grep -qE "lookup $TABLE([^0-9]|\$)" \
+		|| $TT_IP -6 rule add fwmark "$MARK" table "$TABLE" priority "$PRIO"
+
+	# Резолвим endpoint В ОТДЕЛЬНЫЙ файл ДО загрузки правил маркировки. Иначе
+	# в режиме full с include_router_traffic=1 и blackhole-маршрутом (все
+	# три — достижимые настройки) собственный nslookup роутера сам оказался
+	# бы помечен уже загруженной цепочкой, ушёл бы в table $TABLE, где ещё
+	# нет клиента, и провалился бы в blackhole: tt_endpoint4/6 остались бы
+	# пустыми, соединение клиента к своему серверу по имени хоста маркировалось
+	# бы в собственный туннель, а роутер потерял бы DNS и интернет без
+	# другого восстановления, кроме консоли.
+	_ep_file=$(mktemp) || return 1
+	trap 'rm -f "$_ep_file"' EXIT INT TERM
+	resolve_endpoints > "$_ep_file"
+
+	_nft_err=$(dump_ruleset | $TT_NFT -f - 2>&1) || {
+		logger -t trusttunnel "error: nft -f (ruleset) failed: $_nft_err"
+		return 1
+	}
+	add_endpoint_elements "$_ep_file"
+
+	if [ "$MODE" = "selective" ] && [ -f "$OUT_DIR/elements.nft" ]; then
+		# Ошибка НЕ проглатывается: этот файл несёт основные данные продукта
+		# (весь список CIDR для обхода), и `|| true` тут прятал бы отказ,
+		# после которого интерфейс всё равно показывал бы число подсетей,
+		# как если бы они были загружены.
+		_nft_err=$($TT_NFT -f "$OUT_DIR/elements.nft" 2>&1) \
+			|| logger -t trusttunnel "error: nft -f (elements.nft) failed: $_nft_err"
+	fi
+}
+
+do_down() {
+	$TT_NFT delete table inet trusttunnel 2>/dev/null || true
+	$TT_IP rule del fwmark "$MARK" table "$TABLE" priority "$PRIO" 2>/dev/null || true
+	$TT_IP -6 rule del fwmark "$MARK" table "$TABLE" priority "$PRIO" 2>/dev/null || true
+	$TT_IP route flush table "$TABLE" 2>/dev/null || true
+	$TT_IP -6 route flush table "$TABLE" 2>/dev/null || true
+	# Устройство клиента НЕ удаляем: оно не наше, его создаёт и уносит сам
+	# клиент. Раньше здесь стоял `link del`, потому что устройство создавали мы.
+	rm -f "$DEVFILE"
+}
+
+do_status() {
+	# Судим по устройству КЛИЕНТА, а не по имени из настроек: своего устройства
+	# у нас больше нет. "device up" теперь значит "клиент создал устройство и на
+	# нём есть носитель", то есть туннель действительно живой.
+	_cd=$(client_device) || _cd=""
+	_carrier=""
+	[ -n "$_cd" ] && _carrier=$(cat "/sys/class/net/$_cd/carrier" 2>/dev/null)
+	if [ "$_carrier" = "1" ]; then
+		echo "device up"; else echo "device down"; fi
+	[ -n "$_cd" ] && echo "client device $_cd"
+	if $TT_IP rule show 2>/dev/null | grep -qE "lookup $TABLE([^0-9]|\$)"; then
+		echo "rule present"; else echo "rule absent"; fi
+	if [ -n "$($TT_IP route show table "$TABLE" 2>/dev/null)" ]; then
+		echo "table present"; else echo "table absent"; fi
+	if $TT_NFT list table inet trusttunnel >/dev/null 2>&1; then
+		echo "nft present"; else echo "nft absent"; fi
+}
+
+case "$cmd" in
+	dump)   dump_ruleset ;;
+	up)     do_up ;;
+	attach) do_attach "${4:-}" ;;
+	reattach) do_reattach ;;
+	detach) do_detach ;;
+	down)   do_down ;;
+	status) do_status ;;
+	*)      echo "routing: unknown subcommand '$cmd'" >&2; exit 1 ;;
+esac

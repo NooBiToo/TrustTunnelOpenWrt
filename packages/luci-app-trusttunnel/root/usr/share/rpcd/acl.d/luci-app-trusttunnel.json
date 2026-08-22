@@ -1,0 +1,19 @@
+{
+	"luci-app-trusttunnel": {
+		"description": "Grant access to TrustTunnel configuration and diagnostics",
+		"read": {
+			"ubus": {
+				"luci.trusttunnel": [
+					"status", "ping", "probe", "check_domain", "catalog", "log", "versions", "diagnose"
+				]
+			},
+			"uci": [ "trusttunnel" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.trusttunnel": [ "service", "import_config" ]
+			},
+			"uci": [ "trusttunnel" ]
+		}
+	}
+}

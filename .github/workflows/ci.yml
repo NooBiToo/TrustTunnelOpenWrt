@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    # Совпадает с триггером release.yml: без этого тег может уйти в релиз
+    # без единого прогона тестов, потому что push тега сам по себе CI не
+    # запускал.
+    tags: [ 'v*' ]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+
+      # Дефект, из-за которого пакет ставился, но служба не работала: все
+      # скрипты уехали в .apk с режимом 100644. luci.mk копирует root/ через
+      # `cp -pR`, то есть сохраняет права источника, а разработка шла на
+      # Windows, где бита исполнения нет. На роутере это выглядело как «служба
+      # не запускается» БЕЗ ЕДИНОЙ СТРОКИ в журнале — procd просто не может
+      # выполнить файл, и диагностировать нечем.
+      #
+      # Режимы правятся и в Makefile (Build/Compile), но проверка здесь нужна
+      # отдельно: она ловит причину в индексе, а не последствие в сборке.
+      - name: Executable bits
+        run: |
+          need="packages/luci-app-trusttunnel/root/etc/init.d/trusttunnel
+          packages/luci-app-trusttunnel/root/etc/uci-defaults/40-luci-trusttunnel
+          packages/luci-app-trusttunnel/root/etc/hotplug.d/net/40-trusttunnel
+          packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/fetch-lists
+          packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/gen-config
+          packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/gen-lists
+          packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/normalize
+          packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/routing
+          packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/uci-export
+          packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/warm-sets
+          install.sh"
+          fail=0
+          for f in $need; do
+            mode=$(git ls-files -s -- "$f" | awk '{print $1}')
+            [ "$mode" = "100755" ] && continue
+            echo "::error file=$f::mode is $mode, expected 100755 — the package would ship a script that cannot run"
+            fail=1
+          done
+          [ "$fail" = 0 ] && echo "every script that must run is executable in the index"
+          exit "$fail"
+
+      - name: Unit tests
+        run: sh tests/run.sh
+
+      # Версия ЗАКРЕПЛЕНА, и это не педантизм: apt-версия менялась вместе с
+      # образом раннера, а каждый выпуск shellcheck добавляет новые проверки.
+      # Ровно так CI и упал впервые — на SC2317, которого в прежней версии не
+      # существовало, при полностью неизменном коде. Незакреплённый линтер
+      # означает сборку, которая ломается сама по себе в произвольный момент.
+      #
+      # Контейнер, а не apt: тот же образ запускается локально одной командой,
+      # то есть находки воспроизводятся до пуша, а не обнаруживаются в CI.
+      # Обновление версии — осознанный шаг с проверкой, а не побочный эффект.
+      - name: Shellcheck
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src koalaman/shellcheck:v0.11.0 -s sh \
+            install.sh \
+            tests/run.sh \
+            packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/records.sh \
+            packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/normalize \
+            packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/gen-config \
+            packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/gen-lists \
+            packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/fetch-lists \
+            packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/routing \
+            packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/uci-export \
+            packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/warm-sets \
+            packages/luci-app-trusttunnel/root/etc/uci-defaults/40-luci-trusttunnel
+
+      - name: Shell syntax of the init script
+        run: sh -n packages/luci-app-trusttunnel/root/etc/init.d/trusttunnel
+
+      # Проверка синтаксиса ucode (`uc -c` в release.yml) НЕ ловит отсутствующий
+      # импорт: обращение к необъявленной функции — ошибка времени выполнения, а
+      # не разбора. Именно так `rand()` из модуля math, использованный без
+      # импорта, сломал сразу импорт конфига и проверку домена, и не был замечен
+      # ни одной проверкой. Этот шаг сверяет фактически вызванные функции со
+      # списком тех, что живут в модулях, а не в ядре ucode.
+      - name: ucode module imports
+        run: |
+          f=packages/luci-app-trusttunnel/root/usr/share/rpcd/ucode/luci.trusttunnel
+          # Функции, которых НЕТ в ядре ucode: каждая требует import из модуля.
+          # Список намеренно короткий — только то, что реально может понадобиться
+          # этому бэкенду; расширять по мере надобности.
+          fail=0
+          for pair in \
+            'math:rand' 'math:srand' 'math:sqrt' 'math:pow' 'math:abs' \
+            'fs:readfile' 'fs:writefile' 'fs:popen' 'fs:access' 'fs:unlink' \
+            'fs:stat' 'fs:mkdir' 'fs:chmod' 'fs:mkstemp' 'fs:opendir' \
+            'ubus:connect' 'uci:cursor'
+          do
+            mod=${pair%%:*}; fn=${pair##*:}
+            # Вызов функции: имя со скобкой, не как часть другого слова.
+            if grep -qE "(^|[^A-Za-z0-9_.])${fn}[[:space:]]*\(" "$f"; then
+              if ! grep -qE "^import[[:space:]]*\{[^}]*\b${fn}\b[^}]*\}[[:space:]]*from[[:space:]]*'${mod}'" "$f"; then
+                echo "::error file=$f::${fn}() is used but not imported from '${mod}' — this fails at runtime, not at parse time"
+                fail=1
+              fi
+            fi
+          done
+          [ "$fail" = 0 ] && echo "every module function used is imported"
+          exit "$fail"
+
+      - name: JSON syntax
+        run: |
+          for f in $(find packages -name '*.json'); do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
+          done
+
+
+      # Тот же класс ошибки, что и у импортов ucode, и ловится он так же
+      # плохо: `node --check` проверяет синтаксис, а обращение к необъявленному
+      # модулю LuCI — отказ во ВРЕМЯ РАБОТЫ. Именно так на вкладку диагностики
+      # уехало «ui is not defined»: инструменты, использующие ui, были
+      # перенесены со страницы состояния, а строка 'require ui' — нет.
+      - name: LuCI module requires
+        run: |
+          # Ищется именно ВЫЗОВ — `модуль.что-то(` — а не любое упоминание:
+          # слово «network.» встречается в тексте описания поля, и проверка на
+          # подстроку давала ложное срабатывание. Комментарии и текст в
+          # кавычках вызовов не содержат, поэтому этого признака достаточно.
+          mods="ui dom rpc uci form view poll fs network validation"
+          fail=0
+          for f in packages/luci-app-trusttunnel/htdocs/luci-static/resources/view/trusttunnel/*.js; do
+            for m in $mods; do
+              grep -qE "(^|[^A-Za-z0-9_.$])${m}\.[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(" "$f" || continue
+              grep -qE "^'require ${m}'" "$f" && continue
+              echo "::error file=$f::${m} is used but not declared with 'require ${m}' — this fails at runtime, not at parse time"
+              fail=1
+            done
+          done
+          [ "$fail" = 0 ] && echo "every LuCI module used is declared"
+          exit "$fail"
+
+      - name: JavaScript syntax
+        run: |
+          # node --check on a plain LuCI view file is not reliable across
+          # Node versions/module-type detection because each view ends with
+          # a top-level `return` (LuCI views are written to be wrapped in a
+          # function by the loader, not to be a standalone CommonJS module).
+          # Parsing each file's source wrapped in a function expression
+          # sidesteps that and checks the same thing `--check` would.
+          node -e '
+            const fs = require("fs");
+            const vm = require("vm");
+            let failed = false;
+            for (const f of process.argv.slice(1)) {
+              const src = fs.readFileSync(f, "utf8");
+              try {
+                new vm.Script("(function(){\n" + src + "\n})");
+                console.log("ok: " + f);
+              } catch (e) {
+                failed = true;
+                console.error(f + ": " + e.message);
+              }
+            }
+            if (failed) process.exit(1);
+          ' packages/luci-app-trusttunnel/htdocs/luci-static/resources/view/trusttunnel/*.js

@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+# Без этого блока публикация релиза падает с 403 "Resource not accessible by
+# integration": GITHUB_TOKEN по умолчанию выдаётся только на чтение, а создание
+# релиза требует записи в contents. Проверено на живом прогоне по тегу v1.0.0 —
+# всё собралось и загрузилось, упал ровно последний шаг.
+#
+# Право объявлено ЗДЕСЬ, а не переключателем в настройках репозитория: так оно
+# переезжает вместе с кодом (форк, перенос, восстановление из клона) и видно
+# при чтении воркфлоу. Выдаётся минимально необходимое — только contents:write,
+# не write-all.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      # x86-64 здесь — лишь машина сборки, а НЕ целевая платформа: пакет
+      # помечен PKGARCH:=all и одинаково встаёт на aarch64, armv7, mips и
+      # mipsel. Матрица архитектур не нужна, потому что внутри только
+      # скрипты, ucode, JS и конфиги.
+      #
+      # Версия SDK при этом значима: от неё зависят формат apk и поведение
+      # luci.mk. Держим её на последнем выпуске ветки 25.12, чтобы релизная
+      # сборка совпадала с прошивками, на которых пакет проверяется.
+      image: openwrt/sdk:x86-64-25.12.5
+      options: --user root
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: src
+
+      # Кэш результатов сборки зависимостей.
+      #
+      # Замер прогона по тегу v1.0.0: шаг сборки занял 9 м 26 с из 11 м 44 с.
+      # Граф зависимостей (tmp/.packagedeps) предписывает собрать iproute2,
+      # curl, ca-certificates, ucode, luci-base, ядро Linux и тулчейн ПРЕЖДЕ
+      # чем упаковать наш пакет — при том что внутрь не попадает ни один их
+      # артефакт: пакет PKGARCH:=all и состоит из скриптов.
+      #
+      # Убрать эту работу нельзя, зависимости настоящие: попытка урезать фиды
+      # до base/luci/packages провалилась — luci-base тянет lucihttp, cgi-io,
+      # rpcd-mod-luci и nghttp2 из исключённых фидов, и сборка падает. Значит
+      # работу можно только НЕ ПОВТОРЯТЬ, что и делает кэш.
+      #
+      # Кэшируются каталоги SDK, а не рабочего каталога: staging_dir хранит
+      # собранные библиотеки и host-инструменты, build_dir — распакованные
+      # исходники, dl — скачанные архивы. Ключ включает версию образа SDK и
+      # хеш Makefile пакета: смена SDK или зависимостей делает кэш недействи-
+      # тельным сама, без ручного вмешательства. restore-keys даёт частичное
+      # попадание, когда изменился только Makefile — тогда пересобирается
+      # лишь затронутое.
+      #
+      # Каталог feeds НЕ кэшируется намеренно, хотя это стоит около минуты:
+      # scripts/feeds работает символическими ссылками, и одна из них ведёт на
+      # наш пакет в рабочем каталоге. Ссылка, восстановленная из кэша, легко
+      # разойдётся с реальным состоянием — а тихо собранный не тот код хуже
+      # лишней минуты. Клонирование фидов идемпотентно и предсказуемо.
+      - name: Cache the SDK build tree
+        uses: actions/cache@v6
+        with:
+          path: |
+            /builder/staging_dir
+            /builder/build_dir
+            /builder/dl
+          key: sdk-25.12.5-${{ hashFiles('src/packages/luci-app-trusttunnel/Makefile') }}
+          restore-keys: |
+            sdk-25.12.5-
+
+      - name: Prepare the SDK feeds
+        working-directory: /builder
+        run: |
+          cp feeds.conf.default feeds.conf
+          echo "src-link ttowrt ${GITHUB_WORKSPACE}/src/packages" >> feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Build the package
+        working-directory: /builder
+        run: |
+          make defconfig
+          make package/luci-app-trusttunnel/compile -j"$(nproc)" V=s
+
+      # Собирается ХОСТОВЫЙ ucode, а не берётся первый найденный в staging_dir.
+      # Прежний вариант искал `find staging_dir -name ucode` и подхватывал
+      # бинарник, собранный ПОД ЦЕЛЕВУЮ ПЛАТФОРМУ (target-x86_64_musl,
+      # root-x86): запустить его на раннере нельзя, ядро отвечало ENOENT, и шаг
+      # падал с кодом 127 и сообщением "not found". Проверить синтаксис он не
+      # мог в принципе — только упасть либо, до сборки luci-base, промолчать
+      # предупреждением. Пакет ucode поддерживает HostBuild, поэтому
+      # компилятор для хоста собирается явно, и проверка становится настоящей.
+      - name: Check ucode syntax
+        working-directory: /builder
+        run: |
+          # feeds install -a и make defconfig уже выполнены предыдущими шагами,
+          # поэтому здесь только сборка компилятора для хоста.
+          make package/ucode/host/compile -j"$(nproc)"
+
+          # Путь ПРОВЕРЕН в контейнере того же образа SDK: HostBuild кладёт
+          # бинарник в staging_dir/hostpkg/bin, а НЕ в staging_dir/host/bin.
+          uc=staging_dir/hostpkg/bin/ucode
+          [ -x "$uc" ] || { echo "::error::host ucode was not built at $uc"; exit 1; }
+
+          # Бинарник обязан исполняться именно на этой машине. Прежний шаг
+          # брал первый файл с именем ucode из staging_dir и получал сборку под
+          # ЦЕЛЕВУЮ платформу (target-x86_64_musl): ядро отвечало ENOENT, и шаг
+          # падал с кодом 127. Молча пропустить проверку тоже нельзя — зелёный
+          # шаг читается как «синтаксис в порядке».
+          "$uc" -e 'print("")' || { echo "::error::host ucode is not runnable"; exit 1; }
+
+          # ucode -c возвращает 255 на файле с ошибкой и 0 на корректном
+          # (проверено), поэтому код возврата здесь достоверен.
+          "$uc" -c "${GITHUB_WORKSPACE}/src/packages/luci-app-trusttunnel/root/usr/share/rpcd/ucode/luci.trusttunnel"
+
+          # Контроль самой проверки: если компилятор принимает заведомо битый
+          # файл, значит шаг ничего не проверяет, и его зелёный цвет обманывает.
+          printf 'let x = ;\n' > /tmp/broken.uc
+          if "$uc" -c /tmp/broken.uc 2>/dev/null; then
+            echo "::error::the syntax check accepts broken input and proves nothing"
+            exit 1
+          fi
+          echo "ucode syntax ok"
+
+      - name: Collect the artifact
+        working-directory: /builder
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+          # Сборка производит ДВА пакета: сам luci-app и пакет перевода,
+          # который luci.mk генерирует из po/ru как luci-i18n-trusttunnel-ru
+          # (имя выводится из LUCI_BASENAME). Без второго интерфейс остаётся
+          # англоязычным при готовом переводе в репозитории.
+          find bin -name 'luci-app-trusttunnel*' -exec cp {} "${GITHUB_WORKSPACE}/dist/" \;
+          find bin -name 'luci-i18n-trusttunnel-*' -exec cp {} "${GITHUB_WORKSPACE}/dist/" \;
+          ls -l "${GITHUB_WORKSPACE}/dist"
+          # Отсутствие любого из двух пакетов — ошибка сборки, и заметить её
+          # надо здесь, а не у пользователя. Проверка на сам luci-app важна
+          # не меньше: сборка, не давшая ни одного файла, иначе уехала бы
+          # в релиз пустой.
+          ls "${GITHUB_WORKSPACE}/dist"/luci-app-trusttunnel*.apk >/dev/null
+          ls "${GITHUB_WORKSPACE}/dist"/luci-i18n-trusttunnel-*.apk >/dev/null
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package
+          path: dist/*
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*

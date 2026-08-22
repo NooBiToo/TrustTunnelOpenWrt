@@ -1,0 +1,207 @@
+#!/bin/sh
+# Собирает dnsmasq.conf и elements.nft из выбранных списков и своих доменов.
+# Использование: gen-lists <records-file> <lists-dir> <out-dir>
+# Вызывается только в режиме selective.
+set -u
+
+TT_LIBDIR="${TT_LIBDIR:-$(dirname "$0")}"
+# Переопределяется из окружения по тому же образцу, что TT_IP и TT_NFT в
+# routing: иначе проверку наличия прокси нельзя покрыть тестами на машине
+# разработчика, где его нет.
+TT_DOH_BIN="${TT_DOH_BIN:-/usr/sbin/https-dns-proxy}"
+# Путь вычисляется во время работы, статически линтеру его не разрешить.
+# shellcheck disable=SC1091
+. "$TT_LIBDIR/records.sh"
+
+# TT_RECORDS читает подключённый records.sh через tt_get/tt_list — линтер
+# этой связи не видит, потому что не следует за sourcing.
+# shellcheck disable=SC2034
+TT_RECORDS="${1:?usage: gen-lists <records-file> <lists-dir> <out-dir>}"
+LISTS_DIR="${2:?missing lists dir}"
+OUT_DIR="${3:?missing out dir}"
+
+die() { printf 'gen-lists: %s\n' "$1" >&2; exit 1; }
+
+[ "$(tt_get main.mode selective)" = "selective" ] \
+	|| die "mode is not selective; lists are not used"
+
+tmp=$(mktemp -d) || die "cannot create temp dir"
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
+# --- Собираем сырые домены из всех источников ---------------------------------
+: > "$tmp/raw"
+tt_list lists.source | while IFS= read -r rel; do
+	[ -f "$LISTS_DIR/$rel" ] && cat "$LISTS_DIR/$rel" >> "$tmp/raw"
+done
+# Свои URL лежат в каталоге custom/ под именем файла из URL.
+tt_list lists.url | while IFS= read -r url; do
+	base=${url##*/}
+	[ -f "$LISTS_DIR/custom/$base" ] && cat "$LISTS_DIR/custom/$base" >> "$tmp/raw"
+done
+tt_list domains.bypass >> "$tmp/raw"
+
+# --- Нормализуем и вычитаем «не обходить» -------------------------------------
+sh "$TT_LIBDIR/normalize" < "$tmp/raw" > "$tmp/bypass" 2> "$tmp/drop"
+tt_list domains.direct | sh "$TT_LIBDIR/normalize" > "$tmp/direct" 2>/dev/null # dropped counts only bypass, not direct
+
+# Вычитает «не обходить» вместе с поддоменами из файла, поданного аргументом.
+# Вынесено в функцию, потому что применяется дважды: к общему списку обхода и
+# отдельно к своим доменам, которые прогревает warm-sets.
+#
+# Пустой список «не обходить» — это НАСТРОЙКА ПО УМОЛЧАНИЮ, и обрабатывать
+# её идиомой `NR == FNR` нельзя. При пустом первом файле awk не читает из
+# него ни одной записи, поэтому для первой записи ВТОРОГО файла NR и FNR
+# тоже равны, и она уходит в ветку deny — а за ней и все остальные. На живом
+# роутере это съедало ВСЕ домены: сводка показывала `domains 0`,
+# `subtracted 2`, dnsmasq.conf выходил пустым, и селективный режим молча не
+# делал ничего. Фикстуры юнит-тестов всегда содержали domains.direct,
+# поэтому дефект был для них невидим.
+subtract_direct() {
+	if [ -s "$tmp/direct" ]; then
+		awk '
+			NR == FNR { deny[$0] = 1; next }
+			{
+				s = $0
+				while (s != "") {
+					if (s in deny) next
+					sub(/^[^.]*\.?/, "", s)
+				}
+				print
+			}
+		' "$tmp/direct" "$1"
+	else
+		cat "$1"
+	fi
+}
+
+subtract_direct "$tmp/bypass" > "$tmp/final"
+
+# Свои домены — отдельным файлом, для прогрева наборов сразу после применения
+# настроек (см. warm-sets). Ждать первого запроса клиента для них неуместно:
+# человек только что ввёл домен руками и ждёт, что тот заработает, а его
+# устройство вполне может держать адрес в своём кэше и роутер вообще не
+# спросить. Домены списков сообщества так НЕ прогреваются — их тысяча с
+# лишним, и столько запросов при каждом применении это совсем другая цена.
+tt_list domains.bypass | sh "$TT_LIBDIR/normalize" 2>/dev/null > "$tmp/own"
+subtract_direct "$tmp/own" > "$OUT_DIR/own.domains"
+
+dropped=$(awk '/^dropped /{print $2; exit}' "$tmp/drop")
+[ -n "$dropped" ] || dropped=0
+
+# --- dnsmasq.conf -------------------------------------------------------------
+# Кто резолвит домены из списков. Одно поле с тремя значениями вместо прежней
+# пары «флаг + адрес», которые могли противоречить друг другу:
+#
+#   provider — своего резолвера не задаём, домены резолвит то, что настроено
+#              на роутере (обычно DNS провайдера);
+#   plain    — обычный DNS на указанный адрес. Адрес попадает в набор обхода,
+#              поэтому запрос идёт ВНУТРИ туннеля и провайдер его не видит;
+#   doh      — DNS-over-HTTPS через локальный https-dns-proxy, который поднимает
+#              наша же служба. Запрос уходит шифрованным НАПРЯМУЮ, минуя
+#              туннель, поэтому в набор обхода добавлять нечего.
+#
+# tunnel_list_dns читается только для совместимости: на роутерах, обновлённых
+# с прежней версии, uci-defaults переносит его в list_dns, но если миграция
+# почему-то не отработала, ноль в старом флаге по-прежнему означает provider.
+dns_mode=$(tt_get network.list_dns)
+if [ -z "$dns_mode" ]; then
+	if [ "$(tt_bool network.tunnel_list_dns 1)" = "true" ]; then
+		dns_mode=plain
+	else
+		dns_mode=provider
+	fi
+fi
+
+case "$dns_mode" in
+	doh)
+		# Направлять dnsmasq в порт, где никто не слушает, нельзя: домены из
+		# списков просто перестали бы резолвиться, причём молча. Если прокси не
+		# установлен или адрес не задан, строки server= не выдаются вовсе —
+		# домены резолвит провайдер, а обход продолжает работать, потому что
+		# nftset= остаётся на месте. Об этом сообщается в stderr, и вызывающая
+		# сторона пишет это в журнал.
+		#
+		# Путь к бинарнику берётся из окружения по тому же образцу, что TT_IP и
+		# TT_NFT в routing: иначе проверку было бы не покрыть тестами на машине
+		# разработчика, где прокси нет.
+		_doh_url=$(tt_get network.list_doh_url)
+		if [ -z "$_doh_url" ]; then
+			echo "warning: encrypted DNS selected but no resolver URL is set; falling back to the provider resolver" >&2
+			resolver=""; want_dns=false; bypass_resolver=""
+		elif [ ! -x "$TT_DOH_BIN" ]; then
+			echo "warning: encrypted DNS selected but $TT_DOH_BIN is missing; install https-dns-proxy. Falling back to the provider resolver" >&2
+			resolver=""; want_dns=false; bypass_resolver=""
+		else
+			resolver="127.0.0.1#$(tt_get network.list_doh_port 5460)"
+			want_dns=true
+			# Ничего не добавляем в набор: шифрованный запрос идёт напрямую.
+			bypass_resolver=""
+		fi
+		;;
+	provider)
+		resolver=""
+		want_dns=false
+		bypass_resolver=""
+		;;
+	*)
+		resolver=$(tt_get network.list_resolver 1.1.1.1)
+		want_dns=true
+		bypass_resolver="$resolver"
+		;;
+esac
+
+{
+	echo "# Generated by luci-app-trusttunnel. Do not edit."
+	awk -v res="$resolver" -v withdns="$want_dns" '
+		{
+			printf "nftset=/%s/4#inet#trusttunnel#tt_bypass4\n", $0
+			printf "nftset=/%s/6#inet#trusttunnel#tt_bypass6\n", $0
+			if (withdns == "true") printf "server=/%s/%s\n", $0, res
+		}
+	' "$tmp/final"
+} > "$OUT_DIR/dnsmasq.conf"
+
+# --- elements.nft -------------------------------------------------------------
+: > "$tmp/cidr4"
+: > "$tmp/cidr6"
+tt_list lists.subnet | while IFS= read -r rel; do
+	[ -f "$LISTS_DIR/$rel" ] || continue
+	# Разделяем по наличию двоеточия: IPv6-литералы его содержат, IPv4 — нет.
+	# Именно `>>`, а не `>`: цикл запускает новый процесс awk на каждый файл
+	# подсетей, а `print > f` обрезает файл при первом открытии в каждом
+	# процессе. С `>` выжили бы только подсети последнего файла — молча, с
+	# нулевым кодом возврата и с уменьшенным, но внутренне согласованным
+	# счётчиком. Обрезание один раз уже сделано выше через `: > "$tmp/cidr4"`.
+	sed -e 's/#.*$//' -e 's/[[:space:]]//g' "$LISTS_DIR/$rel" \
+		| grep -v '^$' \
+		| awk -v f4="$tmp/cidr4" -v f6="$tmp/cidr6" \
+			'{ if (index($0, ":")) print >> f6; else print >> f4 }'
+done
+
+{
+	echo "# Generated by luci-app-trusttunnel. Do not edit."
+	# Адрес резолвера в наборе обхода нужен ТОЛЬКО в режиме plain: там запрос
+	# идёт обычным DNS, и защита состоит в том, что он уходит внутри туннеля.
+	# В режиме doh запрос уже шифрован и идёт напрямую, а 127.0.0.1 в наборе
+	# был бы бессмысленным (цепочка nft всё равно возвращает управление на
+	# приватных адресах).
+	if [ -n "$bypass_resolver" ]; then
+		printf 'add element inet trusttunnel tt_bypass4 { %s }\n' "$bypass_resolver"
+	fi
+	sort -u "$tmp/cidr4" | while IFS= read -r c; do
+		printf 'add element inet trusttunnel tt_bypass4 { %s }\n' "$c"
+	done
+	sort -u "$tmp/cidr6" | while IFS= read -r c; do
+		printf 'add element inet trusttunnel tt_bypass6 { %s }\n' "$c"
+	done
+} > "$OUT_DIR/elements.nft"
+
+# --- Сводка -------------------------------------------------------------------
+n_bypass=$(wc -l < "$tmp/bypass" | tr -d ' ')
+n_final=$(wc -l < "$tmp/final" | tr -d ' ')
+printf 'domains %s\n' "$n_final"
+printf 'cidr4 %s\n' "$(sort -u "$tmp/cidr4" | grep -c . || true)"
+printf 'cidr6 %s\n' "$(sort -u "$tmp/cidr6" | grep -c . || true)"
+printf 'own %s\n' "$(grep -c . "$OUT_DIR/own.domains" || true)"
+printf 'dropped %s\n' "$dropped"
+printf 'subtracted %s\n' "$(( n_bypass - n_final ))"
