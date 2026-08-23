@@ -22,6 +22,71 @@ function isSubnet(path) {
 	return path.indexOf('Subnets/') === 0;
 }
 
+function baseName(path) {
+	return path.split('/').pop().replace(/\.lst$/, '');
+}
+
+// Схлопывает Subnets/IPv4 и Subnets/IPv6 в ОДНУ группу, где строка на сервис,
+// а не на файл. Дублирование в исходном каталоге двойное, и оба вида здесь
+// снимаются.
+//
+// Первое: репозиторий держит часть файлов в двух экземплярах, отличающихся
+// только регистром имени — Subnets/IPv4/Meta.lst и Subnets/IPv4/meta.lst байт
+// в байт одинаковы, то же с Twitter и Discord. Показывать их как два разных
+// списка значит предлагать выбор, которого нет.
+//
+// Второе: семейства адресов лежат в отдельных каталогах, но решение о них
+// одно. После нормализации регистра имён в IPv4 одиннадцать, в IPv6 десять, и
+// расходится ровно roblox — для остальных десяти две галочки всегда означали
+// одно и то же. Поэтому строка выбирает сразу оба файла, а несимметричный
+// сервис помечается, чтобы отсутствие половины не выглядело нашей потерей.
+//
+// Канонический путь на семейство берётся из ФАКТИЧЕСКИ имеющихся в каталоге,
+// с предпочтением строчного имени: сочинять meta.lst там, где в репозитории
+// остался только Meta.lst, нельзя — fetch-lists печатал бы по такому пути
+// `fail` при каждом обновлении списков.
+function collapseSubnets(groups) {
+	var families = { 'Subnets/IPv4': 'IPv4', 'Subnets/IPv6': 'IPv6' };
+	var merged = null, out = [], byName = {};
+
+	groups.forEach(function(g) {
+		if (!families[g.name]) { out.push(g); return; }
+		if (!merged) {
+			merged = { name: 'Subnets', files: [], collapsed: true };
+			out.push(merged);
+		}
+		g.files.forEach(function(f) {
+			var name = baseName(f.path).toLowerCase();
+			var item = byName[name];
+			if (!item) {
+				item = byName[name] = { name: name, paths: {}, sizes: {}, families: [] };
+				merged.files.push(item);
+			}
+			var fam = families[g.name];
+			// Строчное имя вытесняет вариант с заглавной; обратное — нет.
+			// Так из пары одинаковых файлов остаётся один и тот же
+			// независимо от порядка, в котором их отдал GitHub.
+			var isLower = baseName(f.path) === name;
+			if (!item.paths[fam] || isLower) {
+				item.paths[fam] = f.path;
+				item.sizes[fam] = f.size || 0;
+			}
+			if (item.families.indexOf(fam) < 0) item.families.push(fam);
+		});
+	});
+
+	if (merged)
+		merged.files.forEach(function(item) {
+			item.families.sort();
+			item.allPaths = item.families.map(function(fam) { return item.paths[fam]; });
+			item.size = item.families.reduce(function(sum, fam) {
+				return sum + item.sizes[fam];
+			}, 0);
+		});
+
+	return out;
+}
+
 // Все настройки собраны на ОДНОЙ странице с вкладками, а не разложены по
 // отдельным пунктам меню. Причина не в экономии: в LuCI каждый пункт меню —
 // это отдельная страница, и переход между ними перезагружает всю оболочку
@@ -144,24 +209,44 @@ return view.extend({
 		var self = this;
 		this.checkboxes = [];
 
-		var groups = (catalog.groups || []).map(function(g) {
+		// Выбранным считается сервис, у которого отмечен ЛЮБОЙ вариант пути,
+		// включая старый регистр и одно семейство из двух. Иначе после
+		// схлопывания строк выбор человека выглядел бы потерянным, а
+		// сохранение его бы и потеряло.
+		function anySelected(paths, saved) {
+			var keys = {};
+			saved.forEach(function(p) { keys[p.toLowerCase()] = true; });
+			return paths.some(function(p) { return keys[p.toLowerCase()]; });
+		}
+
+		var groups = collapseSubnets(catalog.groups || []).map(function(g) {
 			var items = g.files.map(function(f) {
-				var subnet = isSubnet(f.path);
+				var subnet = g.collapsed || isSubnet(f.path);
 				var list = subnet ? selectedSubnets : selectedSources;
+				// Строка объединённой группы несёт ОБА пути семейств, а не
+				// один: `collect` разбирает их по пробелу.
+				var paths = f.allPaths || [ f.path ];
 				var cb = E('input', {
 					'type': 'checkbox',
-					'data-path': f.path,
+					'data-path': paths.join(' '),
 					'data-kind': subnet ? 'subnet' : 'source'
 				});
-				if (list.indexOf(f.path) >= 0)
+				if (anySelected(paths, list))
 					cb.checked = true;
 				self.checkboxes.push(cb);
-				var name = f.path.split('/').pop().replace(/\.lst$/, '');
+				var name = f.name || baseName(f.path);
+				var label = [ cb, ' ', name, ' ',
+					E('span', { 'style': 'opacity:.6' },
+						Math.round(f.size / 1024) + ' KiB') ];
+				// Пометка появляется только у несимметричного сервиса (в
+				// каталоге это один roblox, у него нет файла IPv6). Без неё
+				// отсутствие половины читалось бы как наша потеря.
+				if (f.families && f.families.length === 1)
+					label.push(E('span', { 'style': 'opacity:.6' },
+						' · ' + _('%s only').format(f.families[0])));
 				return E('label', {
 					'style': 'display:inline-block;min-width:17em;margin:.15em 0'
-				}, [ cb, ' ', name, ' ',
-					E('span', { 'style': 'opacity:.6' },
-						Math.round(f.size / 1024) + ' KiB') ]);
+				}, label);
 			});
 			return E('div', { 'style': 'margin-bottom:.9em' }, [
 				E('strong', {}, g.name),
@@ -202,10 +287,13 @@ return view.extend({
 		var sources = [], subnets = [];
 		this.checkboxes.forEach(function(cb) {
 			if (!cb.checked) return;
+			// Одна отмеченная строка объединённой группы даёт ДВА пути —
+			// по одному на семейство адресов.
+			var paths = cb.getAttribute('data-path').split(' ').filter(String);
 			if (cb.getAttribute('data-kind') === 'subnet')
-				subnets.push(cb.getAttribute('data-path'));
+				subnets.push.apply(subnets, paths);
 			else
-				sources.push(cb.getAttribute('data-path'));
+				sources.push.apply(sources, paths);
 		});
 		// Пустой список выражается УДАЛЕНИЕМ опции, а не пустым значением.
 		// `uci set` с пустым массивом ubus отвергает — проверено прямым

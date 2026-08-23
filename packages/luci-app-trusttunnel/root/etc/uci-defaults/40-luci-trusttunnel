@@ -148,6 +148,45 @@ if [ -z "$(uci -q get trusttunnel.network.list_dns)" ]; then
 	logger -t trusttunnel "migrated tunnel_list_dns to list_dns=$(uci -q get trusttunnel.network.list_dns)"
 fi
 
+# Схлопывание регистровых дублей в выбранных списках подсетей. Репозиторий
+# списков держит часть файлов в двух экземплярах, отличающихся только регистром
+# имени (Subnets/IPv4/Meta.lst и Subnets/IPv4/meta.lst байт в байт одинаковы,
+# то же с Twitter и Discord), интерфейс до этой версии показывал их как два
+# разных списка, и в конфигурации оказывались оба: на живом роутере 12 путей
+# там, где хватает 8. Роутер скачивал один и тот же файл дважды и хранил в
+# оверлее две копии.
+#
+# Служба НЕ перезапускается: состав подсетей от этой правки не меняется, файлы
+# в паре одинаковые. Меняется только число загрузок при обновлении списков.
+#
+# Парное семейство адресов здесь НЕ добирается, хотя интерфейс теперь выбирает
+# оба сразу. Причина: без каталога с GitHub неизвестно, существует ли вторая
+# половина (у roblox файла IPv6 нет вовсе), а выдуманный путь заставил бы
+# fetch-lists печатать по нему `fail` при каждом обновлении. Досбор делает
+# интерфейс, где каталог под рукой.
+_subnets=$(uci -q get trusttunnel.lists.subnet)
+if [ -n "$_subnets" ]; then
+	# Разбиение по пробелам ЗДЕСЬ НАМЕРЕННОЕ: `uci -q get` отдаёт список
+	# одной строкой через пробел, а пути списков пробелов не содержат.
+	# shellcheck disable=SC2086
+	_before=$(printf '%s
+' $_subnets)
+	_after=$(printf '%s
+' "$_before" | sh /usr/libexec/trusttunnel/canon-subnets)
+	if [ "$_before" != "$_after" ]; then
+		uci -q delete trusttunnel.lists.subnet
+		printf '%s
+' "$_after" | while IFS= read -r _p; do
+			[ -n "$_p" ] || continue
+			uci add_list trusttunnel.lists.subnet="$_p"
+		done
+		uci commit trusttunnel
+		logger -t trusttunnel "collapsed duplicate subnet lists: $(printf '%s
+' "$_before" | grep -c .) paths -> $(printf '%s
+' "$_after" | grep -c .)"
+	fi
+fi
+
 mkdir -p /usr/share/trusttunnel/lists /var/cache/trusttunnel
 
 # Ежедневное обновление списков в 04:17 — время смещено от круглого часа,

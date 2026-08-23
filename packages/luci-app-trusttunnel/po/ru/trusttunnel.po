@@ -816,6 +816,9 @@ msgstr "Служба выключена"
 msgid "Press Start to run it now, or turn on \"Start on boot\" in Settings."
 msgstr "Нажмите «Запустить», чтобы поднять её сейчас, или включите «Запускать при загрузке» в настройках."
 
+msgid "%s only"
+msgstr "только %s"
+
 msgid "Connecting to %s"
 msgstr "Подключение к %s"
 

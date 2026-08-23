@@ -30,6 +30,7 @@ jobs:
           need="packages/luci-app-trusttunnel/root/etc/init.d/trusttunnel
           packages/luci-app-trusttunnel/root/etc/uci-defaults/40-luci-trusttunnel
           packages/luci-app-trusttunnel/root/etc/hotplug.d/net/40-trusttunnel
+          packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/canon-subnets
           packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/fetch-lists
           packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/gen-config
           packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/gen-lists
@@ -67,6 +68,7 @@ jobs:
             tests/run.sh \
             packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/records.sh \
             packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/normalize \
+            packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/canon-subnets \
             packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/gen-config \
             packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/gen-lists \
             packages/luci-app-trusttunnel/root/usr/libexec/trusttunnel/fetch-lists \
