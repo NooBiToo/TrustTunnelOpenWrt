@@ -29,14 +29,24 @@ tmp=$(mktemp -d) || die "cannot create temp dir"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 # --- Собираем сырые домены из всех источников ---------------------------------
+# `awk 1`, а НЕ `cat`: файлы списков приходят БЕЗ завершающего перевода
+# строки — на живом роутере такими оказались 12 из 13 выбранных файлов
+# сообщества, и своя ссылка на чужой список тем более ничего не обещает.
+# `cat` склеивал последний домен файла с первым доменом следующего
+# источника: оба исчезали, а вместо них в набор уходил мусор вида
+# `hdrezka.appinstagram.com`. Так терялся instagram.com — первая строка
+# Services/meta.lst, то есть Instagram не обходился вообще, причём молча:
+# сводка показывала полное число доменов, потому что склейка считается за
+# домен. `awk 1` печатает каждую запись со своим разделителем, поэтому
+# граница файлов всегда остаётся границей строк.
 : > "$tmp/raw"
 tt_list lists.source | while IFS= read -r rel; do
-	[ -f "$LISTS_DIR/$rel" ] && cat "$LISTS_DIR/$rel" >> "$tmp/raw"
+	[ -f "$LISTS_DIR/$rel" ] && awk 1 "$LISTS_DIR/$rel" >> "$tmp/raw"
 done
 # Свои URL лежат в каталоге custom/ под именем файла из URL.
 tt_list lists.url | while IFS= read -r url; do
 	base=${url##*/}
-	[ -f "$LISTS_DIR/custom/$base" ] && cat "$LISTS_DIR/custom/$base" >> "$tmp/raw"
+	[ -f "$LISTS_DIR/custom/$base" ] && awk 1 "$LISTS_DIR/custom/$base" >> "$tmp/raw"
 done
 tt_list domains.bypass >> "$tmp/raw"
 

@@ -95,6 +95,36 @@ assert_contains "$el4" "149.154.160.0/20" "keeps CIDRs from the first subnet lis
 assert_contains "$el4" "162.159.128.0/19" "keeps CIDRs from the second subnet list"
 assert_contains "$sum4" "cidr4 3" "counts CIDRs from every same-family subnet list"
 
+# Файлы списков сообщества приходят БЕЗ завершающего перевода строки —
+# проверено на живом роутере: 12 из 13 выбранных файлов оканчивались прямо на
+# последнем домене. Сборка склеивала такой домен с первым доменом СЛЕДУЮЩЕГО
+# источника, и оба исчезали, а вместо них появлялся мусор вида
+# `hdrezka.appinstagram.com`. Так пропадал instagram.com — первая строка
+# Services/meta.lst, то есть Instagram не обходился вообще, при этом сводка
+# показывала полное число доменов и интерфейс выглядел исправным.
+#
+# Границы у сборки три (список->список, список->свой URL, URL->свои домены),
+# и каждая проверяется отдельно: файлы фикстур намеренно оканчиваются на
+# домене без перевода строки, и комментария в конце у них быть НЕ может —
+# срезание `#...` замаскировало бы склейку.
+cat > "$TT_TEST_TMP/noeol.tsv" <<'EOF'
+main.mode	selective
+network.list_dns	provider
+lists.source	Services/noeol.lst
+lists.source	Services/noeol2.lst
+lists.url	https://example.org/noeol3.lst
+domains.bypass	mine.example
+EOF
+out6="$TT_TEST_TMP/out6"; mkdir -p "$out6"
+sum6="$(sh "$GEN" "$TT_TEST_TMP/noeol.tsv" "$LISTS" "$out6")"
+dns6="$(cat "$out6/dnsmasq.conf")"
+for d in alpha.example omega.example beta.example zeta.example gamma.example sigma.example mine.example; do
+	assert_contains "$dns6" "nftset=/$d/4#" "keeps $d across a file without a trailing newline"
+done
+assert_eq "0" "$(grep -cE 'omega\.examplebeta|zeta\.examplegamma|sigma\.examplemine' "$out6/dnsmasq.conf")" \
+	"never glues domains across source boundaries"
+assert_contains "$sum6" "domains 7" "counts every domain when sources lack a trailing newline"
+
 # Пустой список прямых исключений (по умолчанию в конфигурации) не должен
 # в результате awk NR == FNR идиомы съедать все домены. Проверяем что с пустым
 # domains.direct все 9 уникальных нормализованных доменов выживают.
