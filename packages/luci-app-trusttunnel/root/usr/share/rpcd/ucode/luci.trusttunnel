@@ -647,28 +647,64 @@ return {
 				tun ? '/dev/net/tun present' : 'missing',
 				tun ? '' : 'Install kmod-tun.');
 
-			// Пакетный init https-dns-proxy. Мы используем только его БИНАРНИК,
-			// поднимая свой экземпляр, а его собственный сервис при установке
-			// сам стартует и переписывает dnsmasq всей сети на себя: ставит
-			// noresolv и server=127.0.0.1#5053/5054, где 5053 — DoH Google,
-			// который у российских провайдеров часто не отвечает. Проверено на
-			// живом роутере: картина «работают только сайты из списков» — их
-			// домены шли мимо, на наш экземпляр. Отдельная ловушка: его бэкап
-			// для восстановления (doh_backup_server) загрязняется его же
-			// записями, поэтому одного stop мало — остатки надо чистить.
+			// Пакетный init https-dns-proxy переписывает DNS ВСЕЙ СЕТИ на свои
+			// экземпляры: ставит dnsmasq noresolv и server=127.0.0.1#5053/5054.
+			// Нам от пакета нужен только БИНАРНИК — свой экземпляр на 5460 мы
+			// поднимаем сами, и он обслуживает ТОЛЬКО домены из списков.
 			//
-			// Проверка показывается ТОЛЬКО когда есть что чинить: включённый
-			// сервис или его следы в конфиге dhcp. Молчаливая зелёная строка
-			// «конфликта нет» была бы шумом.
+			// Прежняя подсказка отсюда советовала его сервис выключить и
+			// вычистить его записи из dhcp. Так делать НЕЛЬЗЯ, и это проверено
+			// на живом роутере: вместе с записями уходит noresolv, dnsmasq
+			// съезжает на DNS провайдера из PPPoE, а тот подменяет ответы —
+			// instagram.com приходил как 188.186.154.88 вместо адреса Meta.
+			// Отключение не убирало проблему, а меняло её на худшую: домены из
+			// списков резолвятся через наш экземпляр и продолжают работать, а
+			// всё остальное достаётся провайдеру, поэтому и картина «работают
+			// только сайты из списков» никуда не уходила.
+			//
+			// Поэтому судим НЕ по наличию сервиса, а по тому, отвечает ли
+			// резолвер, который он прописал: беда там, где noresolv остался, а
+			// upstream мёртв. Зелёная строка при живом резолвере не шум — она
+			// отвечает на вопрос, кто вообще резолвит DNS этой сети.
+			let doh_marks = uciget('dhcp.@dnsmasq[0].doh_server');
 			let stock_doh_on = access('/etc/init.d/https-dns-proxy') &&
 				sh('/etc/init.d/https-dns-proxy enabled').code == 0;
-			let stock_doh_marks = length(uciget('dhcp.@dnsmasq[0].doh_server')) > 0;
-			if (stock_doh_on || stock_doh_marks)
-				add('prereq', 'Stock https-dns-proxy service',
-					stock_doh_marks ? 'fail' : 'warn',
-					stock_doh_marks ? 'it has rewritten the DNS of the whole network'
-						: 'enabled, and will rewrite the DNS of the whole network on start',
-					'This package only needs its binary — the service is separate. Disable it and clean up: /etc/init.d/https-dns-proxy stop; /etc/init.d/https-dns-proxy disable; then remove server=127.0.0.1#5053/5054, noresolv and every doh_* option from the dhcp config and restart dnsmasq.');
+			if (stock_doh_on || length(doh_marks)) {
+				let alive = '', dead = '';
+				for (let entry in split(doh_marks, ' ')) {
+					let m = match(trim(entry), /^([0-9.]+)#([0-9]+)$/);
+					if (!m) continue;
+					// Спрашивается example.com, а НЕ домен из списков: запрос
+					// уходит наружу через проверяемый резолвер, и списочный
+					// домен заодно наполнил бы набор обхода — диагностика не
+					// должна менять то, что диагностирует.
+					if (sh_out('nslookup -po=' + shq(m[2]) + ' example.com ' + shq(m[1])).code == 0)
+						alive = (length(alive) ? alive + ', ' : '') + trim(entry);
+					else
+						dead = (length(dead) ? dead + ', ' : '') + trim(entry);
+				}
+				if (length(dead))
+					add('prereq', 'Stock https-dns-proxy service', 'fail',
+						'no answer from ' + dead,
+						'dnsmasq has noresolv, so these are its only upstreams and the whole network is left without working DNS. Fix the failing instance in the https-dns-proxy config (check its resolver_url) or delete that instance, then restart the service. Do not just disable the service: with nothing put in its place dnsmasq falls back to the provider resolver, which may hand back spoofed addresses.');
+				else if (length(alive))
+					add('prereq', 'Stock https-dns-proxy service', 'ok',
+						'the DNS of this network goes through it (' + alive + ')', '');
+				else
+					add('prereq', 'Stock https-dns-proxy service', 'warn',
+						'enabled, but it has not written its resolver into the dnsmasq config',
+						'Start it with /etc/init.d/https-dns-proxy start, otherwise everything outside the selected lists keeps going to the provider resolver.');
+			}
+
+			// Отдельная строка про остальную сеть. Наш экземпляр отвечает
+			// ТОЛЬКО за домены из списков, поэтому без шифрованного upstream у
+			// dnsmasq всё прочее резолвит провайдер — и именно так появляется
+			// подмена, которую человек принимает за отказ обхода. Молчать об
+			// этом нельзя.
+			if (!length(doh_marks) && uciget('dhcp.@dnsmasq[0].noresolv') != '1')
+				add('prereq', 'DNS outside the lists', 'warn',
+					'resolved by the provider',
+					'dnsmasq has no encrypted upstream of its own, so every domain that is not in a selected list goes to the resolver handed out by the provider, which may return spoofed addresses. Install https-dns-proxy and start its service, or point dnsmasq at an encrypted resolver yourself.');
 
 			// --- Служба ---
 			add('service', 'Enabled', enabled ? 'ok' : 'warn',

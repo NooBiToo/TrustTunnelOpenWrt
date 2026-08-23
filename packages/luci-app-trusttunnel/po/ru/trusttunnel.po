@@ -1005,11 +1005,20 @@ msgstr "Таблица nftables исчезла; перезапустите сл�
 msgid "Stock https-dns-proxy service"
 msgstr "Пакетный сервис https-dns-proxy"
 
-msgid "it has rewritten the DNS of the whole network"
-msgstr "он переписал DNS всей сети на себя"
+msgid "enabled, but it has not written its resolver into the dnsmasq config"
+msgstr "включён, но своего резолвера в конфиг dnsmasq не прописал"
 
-msgid "enabled, and will rewrite the DNS of the whole network on start"
-msgstr "включён и при запуске перепишет DNS всей сети на себя"
+msgid "dnsmasq has noresolv, so these are its only upstreams and the whole network is left without working DNS. Fix the failing instance in the https-dns-proxy config (check its resolver_url) or delete that instance, then restart the service. Do not just disable the service: with nothing put in its place dnsmasq falls back to the provider resolver, which may hand back spoofed addresses."
+msgstr "У dnsmasq стоит noresolv, поэтому других upstream у него нет и вся сеть остаётся без работающего DNS. Исправьте неотвечающий экземпляр в конфиге https-dns-proxy (проверьте resolver_url) или удалите его, затем перезапустите сервис. Только не отключайте сервис целиком: без замены dnsmasq откатится на DNS провайдера, а тот может отдавать подменённые адреса."
 
-msgid "This package only needs its binary — the service is separate. Disable it and clean up: /etc/init.d/https-dns-proxy stop; /etc/init.d/https-dns-proxy disable; then remove server=127.0.0.1#5053/5054, noresolv and every doh_* option from the dhcp config and restart dnsmasq."
-msgstr "Нашему пакету нужен только его бинарник — сервис отдельный. Отключите его и приберите: /etc/init.d/https-dns-proxy stop; /etc/init.d/https-dns-proxy disable; затем уберите server=127.0.0.1#5053/5054, noresolv и все опции doh_* из конфига dhcp и перезапустите dnsmasq."
+msgid "Start it with /etc/init.d/https-dns-proxy start, otherwise everything outside the selected lists keeps going to the provider resolver."
+msgstr "Запустите его: /etc/init.d/https-dns-proxy start — иначе всё, что вне выбранных списков, продолжит уходить к DNS провайдера."
+
+msgid "DNS outside the lists"
+msgstr "DNS вне списков"
+
+msgid "resolved by the provider"
+msgstr "резолвит провайдер"
+
+msgid "dnsmasq has no encrypted upstream of its own, so every domain that is not in a selected list goes to the resolver handed out by the provider, which may return spoofed addresses. Install https-dns-proxy and start its service, or point dnsmasq at an encrypted resolver yourself."
+msgstr "У dnsmasq нет своего шифрованного upstream, поэтому каждый домен вне выбранных списков уходит к резолверу, выданному провайдером, а тот может отдавать подменённые адреса. Поставьте https-dns-proxy и запустите его сервис или сами направьте dnsmasq на шифрованный резолвер."
