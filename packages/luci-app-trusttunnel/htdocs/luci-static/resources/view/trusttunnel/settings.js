@@ -526,7 +526,9 @@ return view.extend({
 		o = s.option(form.ListValue, 'list_dns', _('DNS for domains from the lists'),
 			_('Applies in "bypass by list" mode only. Who resolves the domains from your lists, and how the query is protected.'));
 		o.value('plain', _('Plain DNS through the tunnel — the query is hidden by the tunnel itself'));
-		o.value('doh', _('Encrypted DNS over HTTPS — a local proxy, the query goes out encrypted'));
+		// «Локальный прокси» из этой подписи убран: при флаге «ко всей сети»
+		// своего инстанса нет вовсе, работает штатный https-dns-proxy.
+		o.value('doh', _('Encrypted DNS over HTTPS — the query goes out encrypted, directly'));
 		o.value('provider', _('Whatever the router already uses — usually the provider'));
 		o.default = 'plain';
 
@@ -562,7 +564,7 @@ return view.extend({
 		o.value('94.140.14.14', 'AdGuard');
 
 		o = s.option(form.Value, 'list_doh_url', _('DoH resolver URL'),
-			_('The service starts a local https-dns-proxy on the router and points dnsmasq at it, so the query leaves encrypted — but directly, not through the tunnel. For NextDNS with your own profile use https://dns.nextdns.io/<your-id>. Requires the https-dns-proxy package; without it the list domains fall back to the provider resolver and Diagnostics says so.'));
+			_('The resolver itself. Whether it serves only the domains from your lists or the whole network is decided by the checkbox below. The query leaves encrypted, but directly — not through the tunnel. For NextDNS with your own profile use https://dns.nextdns.io/<your-id>. Requires the https-dns-proxy package; without it the list domains fall back to the provider resolver and Diagnostics says so.'));
 		o.depends('list_dns', 'doh');
 		o.placeholder = 'https://dns.quad9.net/dns-query';
 		o.value('https://dns.quad9.net/dns-query', 'Quad9');
@@ -577,12 +579,31 @@ return view.extend({
 			return true;
 		};
 
+		// Флаг, из-за которого разрыв «задал, а не действует» вообще закрылся.
+		// Резолвер выше обслуживал ТОЛЬКО домены из списков, а весь остальной
+		// DNS сети шёл туда, куда его направил штатный https-dns-proxy: любая
+		// проверялка в списках не лежит и показывала чужой резолвер, отчего
+		// настройка выглядела неработающей.
+		//
+		// Своим снипетом в conf-dir общий DNS не забрать — проверено на живом
+		// роутере: wildcard-домен `/#/` приоритета над бездоменными `server=`
+		// не имеет и попадает с ними в один пул. Поэтому служба переводит на
+		// этот URL штатный https-dns-proxy и возвращает его настройки при
+		// остановке.
+		o = s.option(form.Flag, 'doh_network', _('Use this resolver for the whole network'),
+			_('While the service is running, every query from the router and its clients goes to this resolver: the service switches the stock https-dns-proxy over to it and restores its settings when stopped. Two consequences worth knowing before you turn this on. dnsmasq is restarted when the service starts and stops, so the network loses DNS for a fraction of a second. And if this resolver stops answering, the whole network is left without DNS, not just the domains from the lists.'));
+		o.depends('list_dns', 'doh');
+		o.default = '0';
+
 		o = s.option(form.Value, 'list_doh_port', _('Local port for the proxy'),
 			// Порт настраиваемый, а не зашитый: 5053 занимает пакетный init
 			// https-dns-proxy, 5453 — stubby, и при конфликте иначе было бы
 			// нечем разойтись.
 			_('The local proxy listens on 127.0.0.1 at this port. Change it only if something else on the router already uses it.'));
-		o.depends('list_dns', 'doh');
+		// Скрыто, когда резолвер обслуживает всю сеть: своего инстанса в этом
+		// режиме нет вовсе — работает штатный https-dns-proxy на своих портах,
+		// — и задавать порт было бы нечему.
+		o.depends({ list_dns: 'doh', doh_network: '0' });
 		o.default = '5460';
 		o.datatype = 'port';
 

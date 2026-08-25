@@ -47,7 +47,7 @@ listopt endpoint dns_upstream
 # теперь это одно поле с тремя значениями — provider, plain, doh.
 for o in mtu table fwmark blackhole_on_down include_router_traffic \
 		intercept_dns list_dns list_resolver list_doh_url list_doh_port \
-		lan_devices; do
+		doh_network lan_devices; do
 	scalar network "$o"
 done
 

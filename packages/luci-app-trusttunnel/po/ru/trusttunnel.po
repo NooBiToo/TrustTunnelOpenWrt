@@ -942,8 +942,8 @@ msgstr "Действует только в режиме «обход по спи
 msgid "Plain DNS through the tunnel — the query is hidden by the tunnel itself"
 msgstr "Обычный DNS через туннель — запрос скрыт самим туннелем"
 
-msgid "Encrypted DNS over HTTPS — a local proxy, the query goes out encrypted"
-msgstr "Шифрованный DNS over HTTPS — локальный прокси, запрос уходит шифрованным"
+msgid "Encrypted DNS over HTTPS — the query goes out encrypted, directly"
+msgstr "Шифрованный DNS over HTTPS — запрос уходит шифрованным и напрямую"
 
 msgid "Whatever the router already uses — usually the provider"
 msgstr "То, что уже настроено на роутере — обычно DNS провайдера"
@@ -957,11 +957,17 @@ msgstr "Этот адрес помещается в набор обхода, п�
 msgid "DoH resolver URL"
 msgstr "Адрес DoH-резолвера"
 
-msgid "The service starts a local https-dns-proxy on the router and points dnsmasq at it, so the query leaves encrypted — but directly, not through the tunnel. For NextDNS with your own profile use https://dns.nextdns.io/<your-id>. Requires the https-dns-proxy package; without it the list domains fall back to the provider resolver and Diagnostics says so."
-msgstr "Служба поднимает на роутере локальный https-dns-proxy и направляет на него dnsmasq, поэтому запрос уходит шифрованным — но напрямую, а не через туннель. Для NextDNS со своим профилем укажите https://dns.nextdns.io/<ваш-id>. Нужен пакет https-dns-proxy; без него домены из списков резолвит провайдер, и диагностика об этом скажет."
+msgid "The resolver itself. Whether it serves only the domains from your lists or the whole network is decided by the checkbox below. The query leaves encrypted, but directly — not through the tunnel. For NextDNS with your own profile use https://dns.nextdns.io/<your-id>. Requires the https-dns-proxy package; without it the list domains fall back to the provider resolver and Diagnostics says so."
+msgstr "Сам резолвер. Обслуживает он только домены из ваших списков или всю сеть — решает галочка ниже. Запрос уходит шифрованным, но напрямую, а не через туннель. Для NextDNS со своим профилем укажите https://dns.nextdns.io/<ваш-id>. Нужен пакет https-dns-proxy; без него домены из списков резолвит провайдер, и диагностика об этом скажет."
 
 msgid "Enter an https:// URL"
 msgstr "Введите адрес, начинающийся с https://"
+
+msgid "Use this resolver for the whole network"
+msgstr "Применять этот резолвер ко всей сети"
+
+msgid "While the service is running, every query from the router and its clients goes to this resolver: the service switches the stock https-dns-proxy over to it and restores its settings when stopped. Two consequences worth knowing before you turn this on. dnsmasq is restarted when the service starts and stops, so the network loses DNS for a fraction of a second. And if this resolver stops answering, the whole network is left without DNS, not just the domains from the lists."
+msgstr "Пока служба работает, каждый запрос роутера и его клиентов идёт на этот резолвер: служба переводит на него штатный https-dns-proxy и возвращает его настройки при остановке. Два следствия, о которых стоит знать заранее. При старте и остановке службы dnsmasq перезапускается, поэтому сеть на долю секунды остаётся без DNS. И если этот резолвер перестанет отвечать, без DNS останется вся сеть, а не только домены из списков."
 
 msgid "Local port for the proxy"
 msgstr "Локальный порт прокси"
@@ -989,6 +995,24 @@ msgstr "Установите его: apk add https-dns-proxy. До этого д
 
 msgid "Restart the service so the generated dnsmasq config catches up."
 msgstr "Перезапустите службу, чтобы сгенерированный конфиг dnsmasq догнал настройки."
+
+msgid "Encrypted DNS for the whole network"
+msgstr "Шифрованный DNS для всей сети"
+
+msgid "configured, but the service has not applied it"
+msgstr "настроено, но служба это ещё не применила"
+
+msgid "Restart the service so it switches https-dns-proxy over."
+msgstr "Перезапустите службу, чтобы она перевела https-dns-proxy на этот резолвер."
+
+msgid "Install it: apk add https-dns-proxy. Until then the network keeps its current resolver."
+msgstr "Установите его: apk add https-dns-proxy. До этого сеть остаётся на прежнем резолвере."
+
+msgid "dnsmasq spreads queries across all of them, so part of the traffic still goes to another resolver. Restart the service."
+msgstr "dnsmasq раскидывает запросы по всем сразу, поэтому часть трафика по-прежнему уходит на другой резолвер. Перезапустите службу."
+
+msgid "dnsmasq has noresolv, so these are its only upstreams and the whole network is left without working DNS. This service put your own resolver there, so fix the DoH resolver URL in Settings — editing the https-dns-proxy config would be overwritten on the next start. Turning the \"whole network\" checkbox off hands the network back to its previous resolver."
+msgstr "У dnsmasq стоит noresolv, поэтому других upstream у него нет и вся сеть остаётся без работающего DNS. Этот резолвер прописала туда наша служба, поэтому исправлять надо адрес DoH-резолвера в настройках: правка конфига https-dns-proxy будет перезаписана при следующем старте. Снятая галочка «ко всей сети» вернёт сети прежний резолвер."
 
 msgid "empty for now"
 msgstr "пока пусто"

@@ -207,6 +207,19 @@ warn2=$(TT_DOH_BIN="$stub_doh" sh "$GEN" "$TT_TEST_TMP/doh-nourl.tsv" "$LISTS" "
 assert_eq "0" "$(grep -c '^server=' "$outu/dnsmasq.conf")" "doh without a URL: no resolver line"
 assert_contains "$warn2" "no resolver URL" "doh without a URL: says what is missing"
 
+# doh + «ко всей сети»: служба перевела штатный https-dns-proxy на наш
+# резолвер, и он обслуживает сеть целиком. Строка server= для каждого домена из
+# списков указывала бы на тот же резолвер, что и бездоменный upstream, — тысяча
+# с лишним директив, не меняющих ничего, да ещё и на порт 5460, где в этом
+# режиме никто не слушает. Обход обязан остаться живым: его держат nftset=.
+cat "$TT_TEST_TMP/doh.tsv" > "$TT_TEST_TMP/doh-net.tsv"
+printf 'network.doh_network\t1\n' >> "$TT_TEST_TMP/doh-net.tsv"
+outnw="$TT_TEST_TMP/out-doh-network"; mkdir -p "$outnw"
+TT_DOH_BIN="$stub_doh" sh "$GEN" "$TT_TEST_TMP/doh-net.tsv" "$LISTS" "$outnw" >/dev/null
+assert_eq "0" "$(grep -c '^server=' "$outnw/dnsmasq.conf")" "doh for the whole network: no per-domain resolver lines"
+assert_contains "$(cat "$outnw/dnsmasq.conf")" 'nftset=/youtube.com/4' "doh for the whole network: bypass still works"
+assert_eq "0" "$(grep -c '127.0.0.1' "$outnw/elements.nft")" "doh for the whole network: nothing added to the bypass set"
+
 # provider: своего резолвера не задаём вовсе.
 sed 's/^network.tunnel_list_dns\t1$/network.list_dns\tprovider/' "$TT_TEST_TMP/sel.tsv" > "$TT_TEST_TMP/prov.tsv"
 outv="$TT_TEST_TMP/out-provider"; mkdir -p "$outv"

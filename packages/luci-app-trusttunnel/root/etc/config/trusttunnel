@@ -26,6 +26,7 @@ config network 'network'
 	option list_resolver '1.1.1.1'
 	option list_doh_url ''
 	option list_doh_port '5460'
+	option doh_network '0'
 	option lan_devices ''
 
 config lists 'lists'

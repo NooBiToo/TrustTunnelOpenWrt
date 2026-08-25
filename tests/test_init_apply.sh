@@ -114,6 +114,8 @@ assert_eq "restart" "$(change_class network.list_dns selective)" \
 	"выбор типа резолвера поднимает или снимает doh-инстанс"
 assert_eq "restart" "$(change_class network.list_doh_port selective)" \
 	"порт doh-прокси — аргумент команды инстанса"
+assert_eq "restart" "$(change_class network.doh_network selective)" \
+	"флаг «ко всей сети» решает, забирать ли чужой resolver_url"
 
 # Полный перезапуск с настоящим routing down нужен там, где иначе осталась бы
 # висеть прежняя таблица маршрутизации или прежнее правило по отметке.

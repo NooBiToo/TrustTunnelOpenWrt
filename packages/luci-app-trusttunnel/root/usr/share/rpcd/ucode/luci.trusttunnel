@@ -22,6 +22,10 @@ const CACHE = '/var/cache/trusttunnel/catalog.json';
 // после перезагрузки: сами списки сохранялись, а метка исчезала, и интерфейс
 // показывал «никогда» при полностью актуальных данных.
 const LISTS_UPDATED = '/usr/share/trusttunnel/lists.updated';
+// Состояние захвата общего DNS сети. Рядом с меткой выше и по той же причине:
+// OUTDIR на tmpfs, а после перезагрузки при активном захвате исходные
+// resolver_url чужого конфига надо чем-то возвращать.
+const DOH_STATE = '/usr/share/trusttunnel/doh-takeover';
 const CATALOG_TTL = 86400;
 const CATALOG_URL = 'https://api.github.com/repos/itdoginfo/allow-domains/git/trees/main?recursive=1';
 // Проверка обновлений идёт к релизам НАШЕГО репозитория и кэшируется на диск
@@ -124,6 +128,42 @@ function first(map, key, dflt) {
 function uciget(path) {
 	let r = sh('uci -q get ' + shq(path));
 	return trim(r.out);
+}
+
+// URL, который служба записала в конфиг https-dns-proxy, забрав себе общий DNS
+// сети, или null, если не забирала. Признак «в нашем dnsmasq.conf есть
+// 127.0.0.1#порт» в этом режиме не работает: строк server= мы не выдаём вовсе,
+// их заменяет бездоменный upstream штатного прокси.
+function doh_takeover_url() {
+	let raw = readfile(DOH_STATE) ?? '';
+	for (let line in split(raw, '\n')) {
+		let i = index(line, '\t');
+		if (i < 1) continue;
+		if (substr(line, 0, i) == 'applied')
+			return substr(line, i + 1);
+	}
+	return null;
+}
+
+// Сколько инстансов штатного прокси смотрят НЕ на наш резолвер. Проверяются
+// все: dnsmasq держит бездоменные server= в одном пуле и раскидывает запросы
+// по ним, поэтому один забытый инстанс тихо отдавал бы часть запросов чужому
+// резолверу — ровно та беда, из-за которой режим и появился.
+function doh_stray_instances(url) {
+	let out = { total: 0, stray: 0 };
+	let listing = sh_out("uci show https-dns-proxy 2>/dev/null | " +
+		"sed -n 's/^https-dns-proxy\\.\\([^.=]*\\)=https-dns-proxy$/\\1/p'");
+	// Ни присваивания переменной цикла, ни `++` по члену объекта: и то и
+	// другое пришлось бы проверять на живом роутере, а падает такое во время
+	// работы, унося с собой всю вкладку диагностики.
+	for (let raw in split(trim(listing.out), '\n')) {
+		let s = trim(raw);
+		if (!length(s)) continue;
+		out.total = out.total + 1;
+		if (uciget('https-dns-proxy.' + s + '.resolver_url') != url)
+			out.stray = out.stray + 1;
+	}
+	return out;
 }
 
 function set_size(name) {
@@ -670,6 +710,11 @@ return {
 			let stock_doh_on = access('/etc/init.d/https-dns-proxy') &&
 				sh('/etc/init.d/https-dns-proxy enabled').code == 0;
 			if (stock_doh_on || length(doh_marks)) {
+				// Когда общий DNS забран нами, этот сервис работает на нашем
+				// резолвере, и подсказки про правку ЕГО конфига стали бы
+				// вредным советом: служба перезапишет resolver_url при
+				// следующем старте. Чинить надо URL в наших настройках.
+				let owned = doh_takeover_url() != null;
 				let alive = '', dead = '';
 				for (let entry in split(doh_marks, ' ')) {
 					let m = match(trim(entry), /^([0-9.]+)#([0-9]+)$/);
@@ -686,10 +731,14 @@ return {
 				if (length(dead))
 					add('prereq', 'Stock https-dns-proxy service', 'fail',
 						'no answer from ' + dead,
-						'dnsmasq has noresolv, so these are its only upstreams and the whole network is left without working DNS. Fix the failing instance in the https-dns-proxy config (check its resolver_url) or delete that instance, then restart the service. Do not just disable the service: with nothing put in its place dnsmasq falls back to the provider resolver, which may hand back spoofed addresses.');
+						owned
+							? 'dnsmasq has noresolv, so these are its only upstreams and the whole network is left without working DNS. This service put your own resolver there, so fix the DoH resolver URL in Settings — editing the https-dns-proxy config would be overwritten on the next start. Turning the "whole network" checkbox off hands the network back to its previous resolver.'
+							: 'dnsmasq has noresolv, so these are its only upstreams and the whole network is left without working DNS. Fix the failing instance in the https-dns-proxy config (check its resolver_url) or delete that instance, then restart the service. Do not just disable the service: with nothing put in its place dnsmasq falls back to the provider resolver, which may hand back spoofed addresses.');
 				else if (length(alive))
 					add('prereq', 'Stock https-dns-proxy service', 'ok',
-						'the DNS of this network goes through it (' + alive + ')', '');
+						owned
+							? 'switched to your resolver by this service; the DNS of this network goes through it (' + alive + ')'
+							: 'the DNS of this network goes through it (' + alive + ')', '');
 				else
 					add('prereq', 'Stock https-dns-proxy service', 'warn',
 						'enabled, but it has not written its resolver into the dnsmasq config',
@@ -833,7 +882,36 @@ return {
 				// server=, домены резолвит провайдер, обход продолжает
 				// работать — и человек считает, что DNS шифруется, хотя нет.
 				let dns_mode = first(rec, 'network.list_dns', '');
-				if (dns_mode == 'doh') {
+				if (dns_mode == 'doh' && first(rec, 'network.doh_network', '0') == '1') {
+					// Захват общего DNS судится по чужому конфигу, а не по
+					// нашему: строк server= в этом режиме нет, и прежний
+					// признак был бы вечно красным. Отказ здесь тихий — служба
+					// продолжает работать, обход продолжает работать, а DNS
+					// сети остаётся у прежнего резолвера, — поэтому молчать
+					// нельзя.
+					let url = first(rec, 'network.list_doh_url', '');
+					let have_bin = access('/usr/sbin/https-dns-proxy') ? true : false;
+					let applied = doh_takeover_url();
+					let inst = length(url) ? doh_stray_instances(url) : { total: 0, stray: 0 };
+
+					add('lists', 'Encrypted DNS for the whole network',
+						!length(url) ? 'fail'
+							: (!have_bin ? 'fail'
+								: (applied != url ? 'warn'
+									: (inst.stray > 0 ? 'warn' : 'ok'))),
+						!length(url) ? 'no resolver URL set'
+							: (!have_bin ? 'https-dns-proxy is not installed'
+								: (applied != url ? 'configured, but the service has not applied it'
+									: (inst.stray > 0
+										? inst.stray + ' of ' + inst.total + ' stock proxy instances still point elsewhere'
+										: url + ' — the whole network, list domains included'))),
+						!length(url) ? 'Fill in the DoH resolver URL on the Network tab, or switch the mode back.'
+							: (!have_bin ? 'Install it: apk add https-dns-proxy. Until then the network keeps its current resolver.'
+								: (applied != url ? 'Restart the service so it switches https-dns-proxy over.'
+									: (inst.stray > 0
+										? 'dnsmasq spreads queries across all of them, so part of the traffic still goes to another resolver. Restart the service.'
+										: ''))));
+				} else if (dns_mode == 'doh') {
 					let url = first(rec, 'network.list_doh_url', '');
 					let port = first(rec, 'network.list_doh_port', '5460');
 					let have_bin = access('/usr/sbin/https-dns-proxy') ? true : false;

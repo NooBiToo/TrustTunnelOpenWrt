@@ -9,12 +9,22 @@ OUTDIR=/var/etc/trusttunnel
 LISTSDIR=/usr/share/trusttunnel/lists
 RECORDS=$OUTDIR/settings.tsv
 CLIENT=/opt/trusttunnel_client/trusttunnel_client
-DOH_BIN=/usr/sbin/https-dns-proxy
 # Init-скрипт dnsmasq переопределяется из окружения по тому же образцу, что
 # TT_IP и TT_NFT в routing: иначе перезапуск и сброс кэша нельзя покрыть
 # тестами на машине разработчика, где dnsmasq нет вовсе, а именно от них
 # зависит, наполнятся ли наборы после routing up.
 TT_DNSMASQ_INIT="${TT_DNSMASQ_INIT:-/etc/init.d/dnsmasq}"
+# По тому же образцу — всё, к чему обращается захват общего DNS: без этого его
+# не покрыть тестами там, где https-dns-proxy не установлен.
+DOH_BIN="${TT_DOH_BIN:-/usr/sbin/https-dns-proxy}"
+TT_DOH_INIT="${TT_DOH_INIT:-/etc/init.d/https-dns-proxy}"
+# Состояние захвата лежит на ПОСТОЯННОЙ памяти, а НЕ в OUTDIR: OUTDIR на
+# tmpfs, и перезагрузка роутера при активном захвате унесла бы исходные
+# resolver_url чужого конфига вместе с ним — вернуть пользователю его настройки
+# стало бы нечем, а в чужом конфиге навсегда остался бы наш URL. Каталог тот
+# же, где по той же причине живёт метка обновления списков.
+TT_STATE_DIR="${TT_STATE_DIR:-/usr/share/trusttunnel}"
+DOH_STATE="$TT_STATE_DIR/doh-takeover"
 
 # Выставляется link_dnsmasq, читается flush_dns_cache. Обычная переменная
 # процесса: обе функции вызываются в одном и том же вызове init-скрипта.
@@ -296,6 +306,12 @@ abort_restart_cleanup() {
 		_TT_KEEP_ROUTING=0
 		[ -f "$OUTDIR/settings.tsv" ] && "$LIBDIR/routing" down "$OUTDIR/settings.tsv"
 	fi
+	# Тот же довод — про общий DNS, и БЕЗ условия на _TT_RESTARTING: сюда
+	# приходят только неудачный старт и выключенная служба, а в обоих случаях
+	# DNS сети обязан вернуться владельцу. Иначе он остался бы нашим при
+	# неработающей службе — ровно то, чего «DNS следует за службой» не
+	# допускает. Без состояния вызов ничего не делает.
+	doh_takeover_release
 }
 
 
@@ -363,6 +379,181 @@ attach_client_device() {
 	"$LIBDIR/routing" attach "$RECORDS" "$OUTDIR" "$_new"
 }
 
+# Значение из records по ключу. Инлайновый awk по этому файлу повторялся бы в
+# захвате общего DNS десяток раз: records плоский, ключ в первом поле.
+rec_get() {
+	awk -F'\t' -v k="$1" '$1 == k { print $2; exit }' "$RECORDS" 2>/dev/null
+}
+
+# --- Захват общего DNS сети ---------------------------------------------------
+#
+# Резолвер из наших настроек обслуживал ТОЛЬКО домены из списков: генератор
+# выдавал `server=/домен/127.0.0.1#5460`, а весь остальной DNS сети шёл туда,
+# куда его направил штатный https-dns-proxy. Настройка выглядела
+# незаработавшей — любая проверялка в списках не лежит и показывает чужой
+# резолвер.
+#
+# Своим снипетом в conf-dir общий DNS не забрать. ПРОВЕРЕНО на стенде отдельным
+# экземпляром dnsmasq: wildcard-домен `/#/` приоритета над бездоменными
+# `server=` не имеет и попадает с ними в один пул — при `server=127.0.0.1#5053`
+# рядом с `server=/#/127.0.0.1#5460` отвечал Cloudflare. Пул выбирает по
+# скорости, то есть наш резолвер обслуживал бы «иногда», а это хуже честного
+# «никогда».
+#
+# Поэтому владеем ровно ОДНИМ чужим значением — resolver_url, — а всю работу с
+# конфигом dnsmasq оставляем штатному сервису: его init сам делает dhcp_backup
+# create/restore, ставит noresolv и перезапускает dnsmasq. Своего noresolv мы
+# не пишем и в /etc/config/dhcp не заглядываем.
+
+# Захват полагается только в режиме обхода по списку и только при шифрованном
+# резолвере. Обычный DNS (plain) остаётся про домены из списков намеренно:
+# распространить его на всю сеть значило бы посадить DNS всего дома на живость
+# туннеля.
+doh_takeover_wanted() {
+	[ "$(rec_get network.doh_network)" = "1" ] || return 1
+	[ "$(rec_get network.list_dns)" = "doh" ] || return 1
+	_m=$(rec_get main.mode)
+	[ "${_m:-selective}" = "selective" ] || return 1
+	return 0
+}
+
+# Секции возвращаются в том виде, в каком их печатает uci, — то есть индексами
+# `@https-dns-proxy[N]` для анонимных секций. ПРОВЕРЕНО на живом роутере:
+# реальных имён анонимных секций uci не печатает ни в `show`, ни в `-n show`,
+# так что выбора здесь нет. Индекс верен, пока состав секций не менялся, и на
+# это опирается проверка их числа в doh_takeover_release.
+#
+# Тип секции uci печатает без кавычек, а значение опции — в кавычках, поэтому
+# строка секции отличима от строки опции. Именованная секция `config` типа
+# `main`, которая есть в этом конфиге, отсекается по типу.
+doh_sections() {
+	uci show https-dns-proxy 2>/dev/null \
+		| sed -n 's/^https-dns-proxy\.\([^.=]*\)=https-dns-proxy$/\1/p'
+}
+
+doh_takeover_apply() {
+	_url=$(rec_get network.list_doh_url)
+	if [ -z "$_url" ]; then
+		logger -t trusttunnel "error: network-wide encrypted DNS is selected but no resolver URL is set; the network keeps its current resolver"
+		return 1
+	fi
+	if [ ! -x "$DOH_BIN" ] || [ ! -x "$TT_DOH_INIT" ]; then
+		logger -t trusttunnel "error: network-wide encrypted DNS is selected but https-dns-proxy is missing; install it. The network keeps its current resolver"
+		return 1
+	fi
+
+	# Исходные значения сохраняются ТОЛЬКО при первом захвате. Смена URL в
+	# настройках даёт класс restart, возврат при рестарте пропускается, и apply
+	# приходит поверх собственного захвата: перезапись положила бы в бэкап наш
+	# же прежний URL, и вернуть пользователю его настройки стало бы нечем.
+	if [ ! -f "$DOH_STATE" ]; then
+		mkdir -p "$TT_STATE_DIR" || return 1
+		_running=0
+		"$TT_DOH_INIT" running >/dev/null 2>&1 && _running=1
+		_sections=$(doh_sections)
+		{
+			for _s in $_sections; do
+				printf 'saved\t%s\t%s\n' "$_s" \
+					"$(uci -q get "https-dns-proxy.$_s.resolver_url")"
+			done
+			printf 'running\t%s\n' "$_running"
+		} > "$DOH_STATE"
+
+		# Конфиг без единого инстанса бывает после ручной чистки. Без секции их
+		# init не поднимет ничего, и захват оказался бы тихо бесполезным.
+		if [ -z "$_sections" ]; then
+			# Имя, которое печатает `uci add`, — ВНУТРЕННЕЕ имя анонимной
+			# секции этого процесса; в файле конфига оно не сохраняется, и
+			# после commit другой процесс сгенерирует своё. Сохранять его в
+			# состоянии, которое читается при остановке службы, нельзя — при
+			# возврате оно уже ни к чему не привязано. Секций этого типа тут
+			# ноль, поэтому наша — нулевая по счёту, и адрес остаётся верным в
+			# любом процессе.
+			uci add https-dns-proxy https-dns-proxy >/dev/null || return 1
+			_new='@https-dns-proxy[0]'
+			uci set "https-dns-proxy.$_new.listen_port=5053"
+			uci set "https-dns-proxy.$_new.bootstrap_dns=1.1.1.1,1.0.0.1"
+			printf 'created\t%s\n' "$_new" >> "$DOH_STATE"
+		fi
+	fi
+
+	# Переводятся ВСЕ инстансы. Их init не знает опции disabled —
+	# config_foreach start_instance поднимает каждую секцию без условий, —
+	# поэтому оставить второй с чужим резолвером значило бы отдавать ему часть
+	# запросов: dnsmasq держит все бездоменные server= в одном пуле. Заодно
+	# сохраняется двойное плечо их дизайна: два процесса, два порта, два
+	# разных bootstrap_dns, которые мы не трогаем.
+	for _s in $(doh_sections); do
+		uci set "https-dns-proxy.$_s.resolver_url=$_url"
+	done
+	# Строка applied перезаписывается, а не дописывается: по ней при возврате
+	# отличают наше значение от чужой правки, и вторая строка сделала бы сверку
+	# неоднозначной.
+	awk -F'\t' '$1 != "applied"' "$DOH_STATE" > "$DOH_STATE.tmp"
+	printf 'applied\t%s\n' "$_url" >> "$DOH_STATE.tmp"
+	mv "$DOH_STATE.tmp" "$DOH_STATE"
+	uci commit https-dns-proxy
+
+	# Сервис, который до нас не работал, поднимается, а не перезапускается:
+	# при возврате его нужно будет погасить, а не оставить работать.
+	if [ "$(awk -F'\t' '$1 == "running" { print $2; exit }' "$DOH_STATE")" = "1" ]; then
+		"$TT_DOH_INIT" restart
+	else
+		"$TT_DOH_INIT" start
+	fi
+	logger -t trusttunnel "network-wide encrypted DNS: https-dns-proxy switched to $_url"
+}
+
+doh_takeover_release() {
+	[ -f "$DOH_STATE" ] || return 0
+
+	# Секции адресуются индексами, поэтому изменившийся СОСТАВ секций опаснее
+	# изменившегося значения: восстановление по индексу записало бы сохранённый
+	# резолвер не в ту секцию, и проверка значений этого не поймала бы —
+	# уцелевшая секция всё ещё держит наш URL. Расхождение числа секций с
+	# сохранённым означает, что конфиг правили: тогда не трогаем ничего.
+	_have=$(doh_sections | grep -c .)
+	_kept=$(awk -F'\t' '$1 == "saved" || $1 == "created" { n++ } END { print n + 0 }' "$DOH_STATE")
+	if [ "$_have" != "$_kept" ]; then
+		logger -t trusttunnel "warning: the https-dns-proxy instance list changed while we owned it ($_kept saved, $_have now); leaving its config as is"
+		rm -f "$DOH_STATE"
+		return 0
+	fi
+
+	# Пользователь мог сменить resolver_url руками, пока мы владели. Наш бэкап
+	# на этот момент устарел, и восстановить его значило бы затереть осознанную
+	# чужую правку.
+	_applied=$(awk -F'\t' '$1 == "applied" { print $2; exit }' "$DOH_STATE")
+	_foreign=0
+	for _s in $(doh_sections); do
+		[ "$(uci -q get "https-dns-proxy.$_s.resolver_url")" = "$_applied" ] \
+			|| _foreign=1
+	done
+	if [ "$_foreign" = "1" ]; then
+		logger -t trusttunnel "warning: the https-dns-proxy resolver_url was changed by someone else; leaving it as is"
+		rm -f "$DOH_STATE"
+		return 0
+	fi
+
+	awk -F'\t' '$1 == "saved" { print $2, $3 }' "$DOH_STATE" \
+		| while read -r _s _v; do
+			uci set "https-dns-proxy.$_s.resolver_url=$_v"
+		done
+	for _s in $(awk -F'\t' '$1 == "created" { print $2 }' "$DOH_STATE"); do
+		uci delete "https-dns-proxy.$_s"
+	done
+	uci commit https-dns-proxy
+
+	_was=$(awk -F'\t' '$1 == "running" { print $2; exit }' "$DOH_STATE")
+	rm -f "$DOH_STATE"
+	if [ "$_was" = "1" ]; then
+		"$TT_DOH_INIT" restart
+	else
+		"$TT_DOH_INIT" stop
+	fi
+	logger -t trusttunnel "network-wide encrypted DNS released; https-dns-proxy restored"
+}
+
 # Локальный DoH-прокси поднимается ОТДЕЛЬНЫМ экземпляром procd, а не через
 # чужой сервис: конфиг https-dns-proxy мы не трогаем, поэтому если у
 # пользователя уже есть свой экземпляр, он остаётся жить своей жизнью. Порт по
@@ -374,11 +565,17 @@ attach_client_device() {
 # не выдаёт строки server= вовсе — домены резолвит провайдер, обход продолжает
 # работать, а диагностика говорит, что поставить.
 start_doh_proxy() {
-	_mode=$(awk -F'\t' '$1=="network.list_dns"{print $2; exit}' "$RECORDS" 2>/dev/null)
-	[ "$_mode" = "doh" ] || return 0
+	[ "$(rec_get network.list_dns)" = "doh" ] || return 0
+	# Режим проверяется ЗДЕСЬ, а не только в генераторе: gen-lists в режиме
+	# «всё через VPN» отказывается работать вовсе, строк server= не
+	# существует, и инстанс на 5460 поднимался, не обслуживая никого.
+	[ "$(rec_get main.mode)" != "full" ] || return 0
+	# При захвате общего DNS свой инстанс не нужен: сеть целиком уже на нашем
+	# резолвере, домены из списков в том числе.
+	[ "$(rec_get network.doh_network)" != "1" ] || return 0
 
-	_url=$(awk -F'\t' '$1=="network.list_doh_url"{print $2; exit}' "$RECORDS" 2>/dev/null)
-	_port=$(awk -F'\t' '$1=="network.list_doh_port"{print $2; exit}' "$RECORDS" 2>/dev/null)
+	_url=$(rec_get network.list_doh_url)
+	_port=$(rec_get network.list_doh_port)
 	[ -n "$_port" ] || _port=5460
 
 	if [ -z "$_url" ]; then
@@ -471,7 +668,20 @@ start_service() {
 	procd_set_param pidfile /var/run/trusttunnel.pid
 	procd_close_instance
 
-	start_doh_proxy
+	# Отказ захвата службу не останавливает: обход от общего DNS не зависит, а
+	# деградация описана и видна в диагностике — домены из списков достаются
+	# провайдеру, как и без установленного прокси.
+	#
+	# Возврат в ветке else — не перестраховка, а обязательный случай: условие
+	# захвата могло исчезнуть, пока мы владели (сняли флаг, сменили list_dns,
+	# переключили режим), в том числе через перезагрузку роутера, когда stop
+	# не вызывался вовсе. Без него владение зависло бы навсегда.
+	if doh_takeover_wanted; then
+		doh_takeover_apply || true
+	else
+		doh_takeover_release
+		start_doh_proxy
+	fi
 
 	# Привязка к устройству клиента — задача hotplug-скрипта: procd запускает
 	# процесс только ПОСЛЕ возврата отсюда, поэтому дожидаться устройства здесь
@@ -491,8 +701,14 @@ stop_service() {
 	# вызывает unlink_dnsmasq и для окончательных решений (dnsmasq не умеет
 	# nftset; режим стал full) — там пропуск был бы уже неверен, поэтому
 	# условие стоит только у ЭТОГО вызова.
+	#
+	# Возврат общего DNS стоит под тем же условием и по той же причине: отдать
+	# его владельцу, чтобы через секунду забрать снова, — это два лишних
+	# рестарта dnsmasq и провал DNS ВСЕЙ СЕТИ в промежутке, на простое
+	# сохранение настроек.
 	if [ "${_TT_RESTARTING:-0}" != "1" ]; then
 		unlink_dnsmasq
+		doh_takeover_release
 	fi
 	# Маршрутизация разбирается ВСЕГДА, кроме одного случая: apply_settings
 	# уже сравнил настройки и знает, что ни номер таблицы, ни отметка не
@@ -586,8 +802,10 @@ change_class() {
 			printf 'restart_full\n' ;;
 		# Тип резолвера для списков решает, поднимать ли doh-инстанс, а его
 		# адрес и порт — аргументы команды инстанса. И то и другое procd
-		# перечитывает только при старте службы.
-		network.list_dns|network.list_doh_url|network.list_doh_port)
+		# перечитывает только при старте службы. Флаг «ко всей сети» там же:
+		# захват и возврат чужого resolver_url выполняются на старте и стопе.
+		network.list_dns|network.list_doh_url|network.list_doh_port|\
+		network.doh_network)
 			printf 'restart\n' ;;
 		# Остальное уходит в client.toml, а его клиент читает один раз при
 		# запуске. endpoint.* перечислен шаблоном намеренно: в этой секции

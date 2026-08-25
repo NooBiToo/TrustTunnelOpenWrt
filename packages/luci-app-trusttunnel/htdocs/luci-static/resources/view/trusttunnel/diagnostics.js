@@ -134,7 +134,17 @@ var DIAG_TEXT = {
 	'configured, but dnsmasq is not pointed at the proxy': _('configured, but dnsmasq is not pointed at the proxy'),
 	'Fill in the DoH resolver URL on the Network tab, or switch the mode back.': _('Fill in the DoH resolver URL on the Network tab, or switch the mode back.'),
 	'Install it: apk add https-dns-proxy. Until then the list domains are resolved by the provider, unencrypted.': _('Install it: apk add https-dns-proxy. Until then the list domains are resolved by the provider, unencrypted.'),
-	'Restart the service so the generated dnsmasq config catches up.': _('Restart the service so the generated dnsmasq config catches up.')
+	'Restart the service so the generated dnsmasq config catches up.': _('Restart the service so the generated dnsmasq config catches up.'),
+
+	// Строки режима «резолвер для всей сети». Значения с числами и адресами
+	// внутрь карты не попадают: они собираются склейкой в бэкенде, как и
+	// соседние «no answer from …», и переводу поштучно не подлежат.
+	'Encrypted DNS for the whole network': _('Encrypted DNS for the whole network'),
+	'configured, but the service has not applied it': _('configured, but the service has not applied it'),
+	'Restart the service so it switches https-dns-proxy over.': _('Restart the service so it switches https-dns-proxy over.'),
+	'Install it: apk add https-dns-proxy. Until then the network keeps its current resolver.': _('Install it: apk add https-dns-proxy. Until then the network keeps its current resolver.'),
+	'dnsmasq spreads queries across all of them, so part of the traffic still goes to another resolver. Restart the service.': _('dnsmasq spreads queries across all of them, so part of the traffic still goes to another resolver. Restart the service.'),
+	'dnsmasq has noresolv, so these are its only upstreams and the whole network is left without working DNS. This service put your own resolver there, so fix the DoH resolver URL in Settings — editing the https-dns-proxy config would be overwritten on the next start. Turning the "whole network" checkbox off hands the network back to its previous resolver.': _('dnsmasq has noresolv, so these are its only upstreams and the whole network is left without working DNS. This service put your own resolver there, so fix the DoH resolver URL in Settings — editing the https-dns-proxy config would be overwritten on the next start. Turning the "whole network" checkbox off hands the network back to its previous resolver.')
 };
 
 function dtr(s) {

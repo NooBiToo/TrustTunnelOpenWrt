@@ -134,18 +134,31 @@ case "$dns_mode" in
 		# Путь к бинарнику берётся из окружения по тому же образцу, что TT_IP и
 		# TT_NFT в routing: иначе проверку было бы не покрыть тестами на машине
 		# разработчика, где прокси нет.
-		_doh_url=$(tt_get network.list_doh_url)
-		if [ -z "$_doh_url" ]; then
-			echo "warning: encrypted DNS selected but no resolver URL is set; falling back to the provider resolver" >&2
-			resolver=""; want_dns=false; bypass_resolver=""
-		elif [ ! -x "$TT_DOH_BIN" ]; then
-			echo "warning: encrypted DNS selected but $TT_DOH_BIN is missing; install https-dns-proxy. Falling back to the provider resolver" >&2
+		if [ "$(tt_bool network.doh_network 0)" = "true" ]; then
+			# Резолвер стал DNS ВСЕЙ СЕТИ, и служба добилась этого, переведя
+			# на него штатный https-dns-proxy. Домены из списков он обслуживает
+			# заодно, поэтому строка server= для каждого из них указывала бы на
+			# тот же резолвер, что и бездоменный upstream: тысяча с лишним
+			# директив, не меняющих ничего. Свой инстанс на 5460 в этом режиме
+			# не поднимается вовсе, так что указывать было бы и не на что.
+			#
+			# nftset= остаются на месте — именно они наполняют набор обхода, и
+			# без них не работал бы сам обход.
 			resolver=""; want_dns=false; bypass_resolver=""
 		else
-			resolver="127.0.0.1#$(tt_get network.list_doh_port 5460)"
-			want_dns=true
-			# Ничего не добавляем в набор: шифрованный запрос идёт напрямую.
-			bypass_resolver=""
+			_doh_url=$(tt_get network.list_doh_url)
+			if [ -z "$_doh_url" ]; then
+				echo "warning: encrypted DNS selected but no resolver URL is set; falling back to the provider resolver" >&2
+				resolver=""; want_dns=false; bypass_resolver=""
+			elif [ ! -x "$TT_DOH_BIN" ]; then
+				echo "warning: encrypted DNS selected but $TT_DOH_BIN is missing; install https-dns-proxy. Falling back to the provider resolver" >&2
+				resolver=""; want_dns=false; bypass_resolver=""
+			else
+				resolver="127.0.0.1#$(tt_get network.list_doh_port 5460)"
+				want_dns=true
+				# Ничего не добавляем в набор: шифрованный запрос идёт напрямую.
+				bypass_resolver=""
+			fi
 		fi
 		;;
 	provider)
