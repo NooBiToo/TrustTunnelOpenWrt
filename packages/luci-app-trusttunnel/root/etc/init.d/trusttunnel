@@ -285,6 +285,17 @@ abort_restart_cleanup() {
 		_TT_RESTARTING=0
 		unlink_dnsmasq
 	fi
+	# То же рассуждение для маршрутизации, которую stop_service сохранил по
+	# просьбе apply_settings. Расчёт «разбирать не нужно» держался на том, что
+	# start поднимет всё заново; если он до этого не дошёл, служба выключена,
+	# а таблица, правило по отметке и blackhole остались бы висеть, указывая
+	# на туннель, которого нет. Помеченный трафик уходил бы в blackhole при
+	# выключенном обходе — со стороны это выглядит как «интернет пропал», и
+	# связать это с неудавшимся применением настроек невозможно.
+	if [ "${_TT_KEEP_ROUTING:-0}" = "1" ]; then
+		_TT_KEEP_ROUTING=0
+		[ -f "$OUTDIR/settings.tsv" ] && "$LIBDIR/routing" down "$OUTDIR/settings.tsv"
+	fi
 }
 
 
@@ -483,8 +494,144 @@ stop_service() {
 	if [ "${_TT_RESTARTING:-0}" != "1" ]; then
 		unlink_dnsmasq
 	fi
-	[ -f "$OUTDIR/settings.tsv" ] && "$LIBDIR/routing" down "$OUTDIR/settings.tsv"
+	# Маршрутизация разбирается ВСЕГДА, кроме одного случая: apply_settings
+	# уже сравнил настройки и знает, что ни номер таблицы, ни отметка не
+	# менялись, поэтому правила, которые start_service загрузит заново, будут
+	# теми же. Снимать их между stop и start незачем: пока клиент
+	# поднимается, помеченный трафик должен упираться в blackhole, а не
+	# утекать напрямую мимо туннеля, — а именно это и происходило, потому что
+	# без таблицы маркировать трафик нечем.
+	#
+	# Признак по умолчанию НЕ выставлен, и это осознанно: ручной restart,
+	# триггер интерфейса и любой другой вызов ведут себя в точности как
+	# раньше. Дешёвый путь включается только там, где о неизменности
+	# настроек есть доказательство.
+	if [ "${_TT_KEEP_ROUTING:-0}" != "1" ]; then
+		[ -f "$OUTDIR/settings.tsv" ] && "$LIBDIR/routing" down "$OUTDIR/settings.tsv"
+	fi
 	return 0
+}
+
+# Уникальные ключи, которыми различаются два records-файла.
+#
+# Считает ВХОЖДЕНИЯ строк, а не сравнивает множества: list-опции выгружаются
+# в records повторяющимся ключом (несколько строк "lists.source"), и при
+# сравнении множеств добавление второго значения к уже существующему ключу
+# осталось бы незамеченным — снятая или поставленная галочка не применялась бы.
+#
+# awk, а не comm: comm требует отсортированного ввода и присутствует не во всех
+# сборках busybox, а awk есть всегда и обходится одним проходом по каждому файлу.
+changed_keys() {
+	awk -F'\t' '
+		FILENAME == ARGV[1] { seen[$0]++; next }
+		{ seen[$0]-- }
+		END {
+			for (l in seen) if (seen[l] != 0) {
+				split(l, p, "\t")
+				out[p[1]] = 1
+			}
+			for (k in out) print k
+		}
+	' "$1" "$2" | sort -u
+}
+
+# Минимальное действие, которого требует изменение одного ключа.
+# $1 — ключ, $2 — режим работы (selective|full) из НОВОГО состояния.
+#
+# Классы по возрастанию стоимости:
+#   noop         — ничего применять не нужно
+#   reload       — перегенерировать и применить к ядру, клиента не трогать
+#   restart      — перезапустить клиента, маршрутизацию сохранить
+#   restart_full — перезапустить клиента и разобрать маршрутизацию полностью
+#
+# Перечисление ЯВНОЕ и работает как whitelist: всё незнакомое получает
+# restart_full, то есть в точности то поведение, которое было до появления
+# этого разбора. Ошибка в сторону «дороже» стоит лишний перезапуск, ошибка в
+# сторону «дешевле» означает молча непримененную настройку — интерфейс
+# показывает новое значение, а работает старое, и диагностировать это нечем.
+# Полнота перечисления против схемы uci-export проверяется тестом.
+change_class() {
+	case "$1" in
+		# Расписание автообновления читает сам cron во время работы
+		# (update_lists_cron), применять к ядру нечего.
+		lists.auto_update|lists.update_interval)
+			printf 'noop\n' ;;
+		# Списки и свои домены в селективном режиме доходят только до
+		# dnsmasq.conf и elements.nft. В полном режиме при
+		# full_exclude_lists=1 те же списки собираются в exclusions.extra и
+		# уходят третьим аргументом gen-config, то есть в client.toml, —
+		# там без перезапуска клиента настройка не применится.
+		lists.source|lists.subnet|lists.url|domains.bypass|domains.direct)
+			if [ "${2:-selective}" = "selective" ]; then
+				printf 'reload\n'
+			else
+				printf 'restart\n'
+			fi ;;
+		# Адрес открытого резолвера попадает в строки server= файла
+		# dnsmasq.conf, клиент о нём не знает.
+		network.list_resolver)
+			printf 'reload\n' ;;
+		# Всё, из чего собирается nft-таблица и правило по отметке.
+		network.lan_devices|network.blackhole_on_down|\
+		network.include_router_traffic|network.intercept_dns)
+			printf 'reload\n' ;;
+		# Номер таблицы и отметка — единственные значения, по которым
+		# маршрутизация СНИМАЕТСЯ. Сохранить прежнюю и поднять новую значило
+		# бы оставить старую таблицу и старое правило висеть навсегда.
+		network.table|network.fwmark)
+			printf 'restart_full\n' ;;
+		# Выключение службы обязано снять маршрутизацию: иначе помеченный
+		# трафик остался бы уходить в blackhole при выключенном обходе.
+		main.enabled)
+			printf 'restart_full\n' ;;
+		# Тип резолвера для списков решает, поднимать ли doh-инстанс, а его
+		# адрес и порт — аргументы команды инстанса. И то и другое procd
+		# перечитывает только при старте службы.
+		network.list_dns|network.list_doh_url|network.list_doh_port)
+			printf 'restart\n' ;;
+		# Остальное уходит в client.toml, а его клиент читает один раз при
+		# запуске. endpoint.* перечислен шаблоном намеренно: в этой секции
+		# нет и не может появиться значения, не попадающего в конфиг клиента.
+		main.mode|main.full_exclude_lists|main.log_level|network.mtu|endpoint.*)
+			printf 'restart\n' ;;
+		*)
+			printf 'restart_full\n' ;;
+	esac
+}
+
+class_rank() {
+	case "$1" in
+		noop) printf '0\n' ;;
+		reload) printf '1\n' ;;
+		restart) printf '2\n' ;;
+		*) printf '3\n' ;;
+	esac
+}
+
+# Дороже из двух классов.
+class_max() {
+	if [ "$(class_rank "$1")" -ge "$(class_rank "$2")" ]; then
+		printf '%s\n' "$1"
+	else
+		printf '%s\n' "$2"
+	fi
+}
+
+# Действие, которого требует переход от одного records-состояния к другому:
+# максимум по всем изменившимся ключам. Максимум, а не первый или последний, —
+# дешёвая правка рядом с дорогой не должна её обесценивать.
+classify_change() {
+	# Режим берётся из НОВОГО файла: применяем то состояние, к которому идём.
+	# Отсутствие ключа означает селективный режим — uci-export не выгружает
+	# пустые значения, и ту же подстановку делают regenerate, gen-lists и
+	# routing.
+	_mode=$(awk -F'\t' '$1=="main.mode"{print $2; exit}' "$2" 2>/dev/null)
+	[ -n "$_mode" ] || _mode=selective
+	_best=noop
+	for _k in $(changed_keys "$1" "$2"); do
+		_best=$(class_max "$_best" "$(change_class "$_k" "$_mode")")
+	done
+	printf '%s\n' "$_best"
 }
 
 # Переопределяет generic restart() из /etc/rc.common (stop; start), чтобы
@@ -505,8 +652,108 @@ restart() {
 	start "$@"
 }
 
+# Применяет изменившиеся настройки минимальным действием, которое их
+# действительно применяет.
+#
+# ЗАЧЕМ. Раньше здесь стоял безусловный restart, и любая правка — хоть одна
+# галочка в списке доменов — убивала клиента: туннель рвался на несколько
+# секунд. Вместе с ним между stop и start исчезала nft-таблица, так что
+# помеченный трафик LAN успевал уйти НАПРЯМУЮ — обычное сохранение настроек
+# само открывало ровно ту утечку, от которой этот пакет защищает. При этом
+# клиент читает client.toml один раз при запуске, а правка, которая до
+# client.toml не доходит, к его перезапуску отношения не имеет вовсе.
+#
+# Решение принимается по diff'у записи о применённом состоянии с тем, что
+# выгружается из UCI сейчас; ключи классифицирует change_class. Любой отказ по
+# дороге откатывается к полному перезапуску: правила в ядре в этот момент в
+# неизвестном состоянии, и оставить всё как есть значило бы показывать
+# работающую службу поверх недогруженной таблицы.
+apply_settings() {
+	# Сравнивать не с чем — это обычный старт, а не применение поверх
+	# известного состояния. /var на OpenWrt в tmpfs, поэтому после
+	# перезагрузки записи нет вовсе. То же и для остановленной службы.
+	if [ ! -f "$RECORDS" ] || ! running >/dev/null 2>&1; then
+		restart
+		return $?
+	fi
+
+	# Тот же umask, что в regenerate: в records попадает пароль endpoint, и
+	# создавать файл под системным umask значило бы оставить его читаемым
+	# всем — ровно та экспозиция, которую regenerate уже закрыл.
+	umask 077
+	mkdir -p "$OUTDIR"
+	if ! "$LIBDIR/uci-export" > "$RECORDS.next"; then
+		# Файл удаляется и на этом пути: недописанный, он всё равно может
+		# содержать пароль.
+		rm -f "$RECORDS.next"
+		logger -t trusttunnel "warning: settings export failed, applying the long way"
+		restart
+		return $?
+	fi
+
+	_class=$(classify_change "$RECORDS" "$RECORDS.next")
+
+	# Сертификат — единственное значение схемы, которого в records нет: PEM
+	# многострочный, а значение записи перевод строки содержать не может.
+	# Сверяется с файлом, который regenerate записал при последнем
+	# применении; без этой сверки смена или удаление сертификата не
+	# применялись бы вовсе, потому что records при них не меняется.
+	_cert_now=$(uci -q get trusttunnel.endpoint.certificate 2>/dev/null)
+	_cert_was=""
+	[ -f "$OUTDIR/endpoint.pem" ] && _cert_was=$(cat "$OUTDIR/endpoint.pem" 2>/dev/null)
+	if [ "$_cert_now" != "$_cert_was" ]; then
+		_class=$(class_max "$_class" restart)
+	fi
+
+	case "$_class" in
+		noop)
+			# Запись обновляется и здесь. Иначе изменившийся ключ остался бы
+			# отличаться от применённого состояния и участвовал бы в КАЖДОМ
+			# следующем сравнении — одна правка расписания навсегда сделала
+			# бы все дальнейшие применения дорогими.
+			mv "$RECORDS.next" "$RECORDS"
+			logger -t trusttunnel "settings applied: nothing to do for these keys"
+			;;
+		reload)
+			# Свой снимок здесь не нужен: regenerate выгружает UCI сам и
+			# сам переносит запись по успеху.
+			rm -f "$RECORDS.next"
+			if regenerate && "$LIBDIR/routing" up "$RECORDS" "$OUTDIR"; then
+				# reattach именно ЗДЕСЬ, а не в надежде на hotplug: событие
+				# add не придёт — устройство клиента никуда не исчезало.
+				# Сам маршрут при этом обычно выживает, потому что do_up
+				# делает route replace, а не flush, но полагаться на это
+				# молча не стоит: вызов идемпотентен и стоит одну команду.
+				"$LIBDIR/routing" reattach "$RECORDS" "$OUTDIR"
+				link_dnsmasq
+				flush_dns_cache
+				warm_sets
+				logger -t trusttunnel "settings applied without restarting the client"
+			else
+				logger -t trusttunnel "warning: applying without a restart failed, restarting the service"
+				restart
+				return $?
+			fi
+			;;
+		restart)
+			rm -f "$RECORDS.next"
+			# Маршрутизация переживает цикл stop+start: diff доказал, что
+			# ни номер таблицы, ни отметка не менялись, а значит правила,
+			# которые start_service загрузит заново, будут теми же. Пока
+			# клиент поднимается, помеченный трафик держит blackhole вместо
+			# того чтобы утекать напрямую.
+			_TT_KEEP_ROUTING=1
+			restart
+			;;
+		*)
+			rm -f "$RECORDS.next"
+			restart
+			;;
+	esac
+}
+
 reload_service() {
-	restart
+	apply_settings
 }
 
 service_triggers() {

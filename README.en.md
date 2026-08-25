@@ -465,6 +465,34 @@ not apply to it — unless the **Intercept client DNS** checkbox
 (`intercept_dns`) is enabled, which redirects UDP/TCP port 53 to the router
 and blocks port 853.
 
+### What happens on Save & Apply
+
+The client reads its config once, at startup, so any settings change used to
+mean a restart: the tunnel dropped for a few seconds. Worse, the nft table went
+down with the client, leaving nothing to mark traffic with — so marked LAN
+traffic went out directly. Saving settings opened the very leak this package
+protects against.
+
+The service now compares the applied state (`settings.tsv`) with what UCI
+exports and does exactly what the changed keys require:
+
+| What changed | What happens | Tunnel |
+| --- | --- | --- |
+| List auto-update schedule | nothing: cron reads it at runtime | stays up |
+| Selected lists, own domains, plain resolver address, LAN devices, killswitch, DNS interception | rules are regenerated and reloaded into the kernel, the route is reattached to the live device | stays up |
+| Server address and credentials, certificate, MTU, mode, log level, resolver type for lists | the client restarts, routing is kept — traffic hits the killswitch instead of leaking out directly | drops |
+| Routing table number, fwmark, enabling and disabling the service | full restart with routing torn down: there is no other way to remove the previous table and rule | drops |
+
+The classification is a whitelist: any key missing from it gets a full restart.
+A needless restart costs a few seconds, while a skipped apply would look like
+"the interface shows the new value but the old one is in effect" — a failure
+with nothing to diagnose it by. A test checks the list against the settings
+schema, so a new option cannot be added without deciding how it applies.
+
+In full mode, editing lists also restarts the client: with **Exclude the
+selected lists** enabled they go into the client config rather than into the
+dnsmasq rules.
+
 ### Where things live
 
 | Path | Contents |
