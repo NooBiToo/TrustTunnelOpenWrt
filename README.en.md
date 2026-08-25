@@ -432,6 +432,48 @@ matters on a router with 8 MB of flash. Without it no `server=` lines are
 emitted at all — the ISP resolves the list domains, bypass keeps working, and
 Diagnostics says what to install.
 
+#### A resolver for the whole network
+
+By default the resolver you set here serves **only the domains from your
+lists**: each one gets a `server=/domain/127.0.0.1#5460` line and that is all.
+Every other query in the network goes wherever the stock `https-dns-proxy`
+pointed dnsmasq — usually Cloudflare. Hence the most common complaint about this
+setting: you entered NextDNS and a test page still reports Cloudflare. The test
+page is right — `test.nextdns.io` is not in the bypass lists.
+
+The **Use this resolver for the whole network** checkbox (`doh_network`) closes
+that gap. While the service runs, it switches the stock `https-dns-proxy` over
+to your URL — every instance of it — and restores its settings when stopped.
+The dnsmasq config is never touched by us: `noresolv` and
+`server=127.0.0.1#5053` are written by that package's own init, which already
+has a backup-and-restore mechanism for exactly this.
+
+Every instance is switched, not just the first: their init knows no `disabled`
+option and starts each section, while dnsmasq keeps all domain-less `server=`
+entries in one pool and spreads queries across them. One forgotten instance
+would quietly hand part of the traffic to another resolver.
+
+A conf-dir snippet of our own cannot take the network's DNS over, and this was
+verified on a live router with a separate dnsmasq instance: the wildcard domain
+`/#/` has no precedence over domain-less `server=` entries and lands in the same
+pool. With `server=127.0.0.1#5053` next to `server=/#/127.0.0.1#5460`,
+Cloudflare answered. Our resolver would serve "sometimes" — worse than an honest
+"never".
+
+Worth knowing before you turn it on:
+
+- dnsmasq is restarted when the service starts and stops, so the network loses
+  DNS for a fraction of a second;
+- if the resolver stops answering, **the whole network** is left without DNS,
+  not just the list domains: dnsmasq has `noresolv` and no other upstream;
+- our own instance on `list_doh_port` is not started in this mode, and no
+  `server=` lines are emitted for the list domains — they would point at the
+  same resolver as the general upstream;
+- if you edited `resolver_url` by hand while the checkbox was on, the service
+  notices on stop and will **not** overwrite your edit with its backup — but
+  the previous values are then lost to it;
+- the checkbox is off by default, and upgrading the package does not turn it on.
+
 **`provider`** — no resolver of ours; the domains are resolved by whatever the
 router already uses.
 
@@ -607,7 +649,8 @@ by hand** — they are overwritten on every start.
 | `list_dns` | `plain` | Who resolves the list domains: `plain` — ordinary DNS through the tunnel, `doh` — encrypted via a local proxy, `provider` — whatever the router already uses. `selective` only |
 | `list_resolver` | `1.1.1.1` | Resolver address for `plain` mode. Accepts `address#port` |
 | `list_doh_url` | empty | DoH resolver URL for `doh` mode, e.g. `https://dns.nextdns.io/<id>` |
-| `list_doh_port` | `5460` | Local port the `https-dns-proxy` we start listens on |
+| `list_doh_port` | `5460` | Local port the `https-dns-proxy` we start listens on. Unused when `doh_network` is set |
+| `doh_network` | `0` | Make the resolver from `list_doh_url` the DNS of the whole network, not only of the list domains: while running, the service switches the stock `https-dns-proxy` over to it and restores its settings on stop. `doh` only |
 | `intercept_dns` | `0` | Intercept client DNS: redirect port 53 to the router and block port 853. `selective` only |
 
 ### `lists` section
