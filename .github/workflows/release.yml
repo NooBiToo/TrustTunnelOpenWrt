@@ -24,30 +24,49 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Каталог артефактов отделён от фида НАМЕРЕННО: действие переносит
+      # собранный bin/ в ARTIFACTS_DIR, а фидом у нас теперь служит весь
+      # репозиторий — без этого разделения сотня чужих .apk высыпалась бы
+      # прямо в рабочее дерево. Каталог создаётся заранее: действие делает
+      # `chown` на оба пути ДО запуска контейнера и на отсутствующем падает.
+      - name: Prepare the artifacts directory
+        run: mkdir -p out
+
       # Сборка отдана штатному действию OpenWrt: оно поднимает контейнер SDK,
-      # подкладывает наш каталог как фид и собирает пакет. Взамен ста сорока
+      # подкладывает репозиторий как фид и собирает пакет. Взамен ста сорока
       # строк ручной оркестрации мы получаем ещё и `make package/<pkg>/check`
       # — проверку метаданных и хешей, которой у ручного варианта не было.
       #
       # Цена перехода — время: staging_dir и build_dir живут внутри контейнера
       # и кэшу actions/cache недоступны, поэтому зависимости (luci-base, ucode,
       # curl, тулчейн) собираются каждый раз заново. По замерам это ничего не
-      # меняет: релизы 1.0.5–1.0.9 с ручным кэшем занимали 12 м 09 с — 12 м 36 с,
-      # то есть кэш и раньше почти не срабатывал.
+      # стоит: релизы 1.0.5–1.0.9 с ручным кэшем занимали 12 м 09 с — 12 м 36 с,
+      # первый прогон на действии — 11 м 13 с. Кэш и раньше почти не срабатывал.
       - name: Build package via OpenWrt SDK Action
         uses: openwrt/gh-action-sdk@v7
         env:
           ARCH: x86-64-25.12.5
           FEEDNAME: ttowrt
-          # ПУТЬ ОБЯЗАН БЫТЬ АБСОЛЮТНЫМ. Действие подставляет это значение
-          # прямо в `docker run -v <FEED_DIR>:/feed`, а docker трактует
-          # относительное значение не как каталог, а как ИМЯ ТОМА: вместо
-          # нашего `packages/` в контейнер приезжает пустой том, фид выходит
-          # пустым, и сборка падает на `make package/luci-app-trusttunnel/
-          # download` с «No rule to make target». Проверено локально:
-          # `docker run -v packages:/feed alpine ls /feed` показывает пустоту
-          # и создаёт том с именем packages.
-          FEED_DIR: ${{ github.workspace }}/packages
+          # Фидом объявлен ВЕСЬ репозиторий, а не каталог packages/, и путь
+          # обязан быть АБСОЛЮТНЫМ. Две разные причины, обе проверены.
+          #
+          # Абсолютный — потому что действие подставляет это значение прямо в
+          # `docker run -v <FEED_DIR>:/feed`, а docker трактует относительное
+          # значение не как каталог, а как ИМЯ ТОМА: в контейнер приезжает
+          # пустой том, фид выходит пустым, и сборка падает на
+          # `make package/luci-app-trusttunnel/download`. Проверено локально:
+          # `docker run -v packages:/feed alpine ls /feed` показывает пустоту.
+          #
+          # Весь репозиторий — потому что вместе с packages/ в контейнер обязан
+          # попасть .git. Версию пакета перевода luci.mk берёт из `git log -1`
+          # (findrev в luci.mk), и без репозитория срабатывает запасная ветка
+          # с меткой времени: вместо 26.238.08051~9f6fb1a получается
+          # 0.260826.21528. Это не косметика — apk видит в такой версии
+          # ПОНИЖЕНИЕ и пишет «Downgrading luci-i18n-trusttunnel-ru
+          # (26.237.58633~00f8120 -> 0.260826.21528)». Проверено на живом
+          # роутере через `apk add --simulate`.
+          FEED_DIR: ${{ github.workspace }}
+          ARTIFACTS_DIR: ${{ github.workspace }}/out
           PACKAGES: luci-app-trusttunnel
 
       - name: Collect artifacts
@@ -55,8 +74,8 @@ jobs:
           mkdir -p dist
           # Сборка производит ДВА пакета: сам luci-app и пакет перевода,
           # который luci.mk генерирует из po/ru как luci-i18n-trusttunnel-ru.
-          find bin/ -name 'luci-app-trusttunnel*.apk' -exec cp {} dist/ \;
-          find bin/ -name 'luci-i18n-trusttunnel-*.apk' -exec cp {} dist/ \;
+          find out/bin/ -name 'luci-app-trusttunnel*.apk' -exec cp {} dist/ \;
+          find out/bin/ -name 'luci-i18n-trusttunnel-*.apk' -exec cp {} dist/ \;
           ls -la dist/
           # Отсутствие любого из двух пакетов — ошибка сборки, и заметить её
           # надо здесь, а не у пользователя.
@@ -79,7 +98,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: build-logs
-          path: logs/
+          path: out/logs/
           if-no-files-found: ignore
 
       - name: Publish the release
