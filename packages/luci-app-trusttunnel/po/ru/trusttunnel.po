@@ -513,6 +513,12 @@ msgstr "недоступна — нет сети и нет сохранённо�
 msgid "GitHub unreachable, showing the last cached result"
 msgstr "GitHub недоступен, показан последний сохранённый результат"
 
+msgid "the installed version is newer than the latest release (%s)"
+msgstr "установлена версия новее последнего релиза (%s)"
+
+msgid "Check now"
+msgstr "Проверить сейчас"
+
 msgid "Diagnostics"
 msgstr "Диагностика"
 

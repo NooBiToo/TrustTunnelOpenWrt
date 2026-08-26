@@ -34,6 +34,14 @@ const CATALOG_URL = 'https://api.github.com/repos/itdoginfo/allow-domains/git/tr
 // секунд. Без кэша один открытый браузер исчерпал бы лимит за десять минут.
 const RELEASE_URL = 'https://api.github.com/repos/NooBiToo/TrustTunnelOpenWrt/releases/latest';
 const VERSION_CACHE = '/var/cache/trusttunnel/release.json';
+// Своё время жизни, КОРОЧЕ каталожного. Суточный TTL означал, что вышедший
+// релиз остаётся невидимым для роутера до суток, и всё это время страница
+// состояния уверенно пишет «актуальная версия». Проверено на живом роутере:
+// кэш, записанный 25 августа в 12:03 UTC, отдавал v1.0.6 при уже вышедших
+// 1.0.7, 1.0.8 и 1.0.9. Шесть часов — четыре запроса в сутки на роутер,
+// то есть по-прежнему исчезающая доля от 60 неавторизованных запросов в час,
+// которыми ограничивает GitHub.
+const RELEASE_TTL = 21600;
 
 // sh() склеивает stderr в stdout: нужно там, где текст ошибки сам является
 // результатом (управление службой, лог, импорт).
@@ -977,7 +985,8 @@ return {
 		call: function(req) {
 			let out = {
 				client: null, package: null, latest: null,
-				update_available: false, checked_at: null, stale: false
+				update_available: false, checked_at: null, stale: false,
+				ahead: false
 			};
 
 			// Клиент печатает "trusttunnel_client 1.0.49".
@@ -994,12 +1003,12 @@ return {
 			let mp = match(trim(rp.out), /luci-app-trusttunnel-([^ \t\n]+)/);
 			if (mp) out.package = mp[1];
 
-			// Сетевая часть: последний релиз нашего репозитория, с суточным
-			// кэшем на диске. При недоступности GitHub отдаём кэш с пометкой
-			// stale, а не ошибку — знать свою версию полезно и без сети.
+			// Сетевая часть: последний релиз нашего репозитория, с кэшем на
+			// диске. При недоступности GitHub отдаём кэш с пометкой stale, а
+			// не ошибку — знать свою версию полезно и без сети.
 			let st = stat(VERSION_CACHE);
 			let now = time();
-			let fresh = st && (now - st.mtime) < CATALOG_TTL;
+			let fresh = st && (now - st.mtime) < RELEASE_TTL;
 			let refresh = req.args?.refresh ?? false;
 			let tag = null;
 
@@ -1009,6 +1018,20 @@ return {
 					tag = c.tag;
 					out.checked_at = c.checked_at;
 				} catch (e) { }
+
+				// Кэш, в котором «последний релиз» СТАРШЕ установленного
+				// пакета, описывает состояние, которого не бывает: обновиться
+				// до версии, которой ещё нет в релизах, обычному роутеру
+				// неоткуда. Значит кэш отстал, и держаться за него нельзя —
+				// иначе страница пишет «актуальная версия» ровно тому, кто
+				// отстал на несколько выпусков. Ровно так и вышло на живом
+				// роутере: кэш с v1.0.6 при установленном 1.0.8-r1 прятал
+				// вышедший 1.0.9. Обнуляем tag и идём в сеть, не дожидаясь TTL.
+				if (tag != null && out.package != null &&
+				    vercmp(tag, out.package) < 0) {
+					tag = null;
+					out.checked_at = null;
+				}
 			}
 
 			if (tag == null) {
@@ -1037,8 +1060,17 @@ return {
 			}
 
 			out.latest = tag;
-			if (tag != null && out.package != null)
-				out.update_available = vercmp(tag, out.package) > 0;
+			if (tag != null && out.package != null) {
+				let c = vercmp(tag, out.package);
+				out.update_available = c > 0;
+				// Установленное новее последнего релиза бывает у сборки из
+				// main (артефакт CI) — и у отставшего кэша, который не удалось
+				// обновить, потому что GitHub недоступен. В обоих случаях
+				// «актуальная версия» — неверный ответ: в первом он верен лишь
+				// случайно, во втором просто ложен. Признак отдаётся отдельно,
+				// чтобы интерфейс сказал, что видит на самом деле.
+				out.ahead = c < 0;
+			}
 			return out;
 		}
 	},

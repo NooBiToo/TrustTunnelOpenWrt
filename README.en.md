@@ -285,12 +285,16 @@ cause is in the client log, not in the routing.
 
 The bottom of the status page shows the installed package version, the
 TrustTunnel client version, and an update check against the repository
-releases. The check result is cached for a day: GitHub allows 60
+releases. The check result is cached for six hours: GitHub allows 60
 unauthenticated requests per hour per address, and the page polls regularly.
+The "Check now" button asks GitHub immediately, without waiting for the cache
+to expire.
 
 The check distinguishes "no update" from "could not check" — the latter is
 shown as its own line. With no network it shows the last cached result, marked
-as such.
+as such. A third case is named separately: the installed version is newer than
+the latest release (a build from `main`, or a cache that could not be
+refreshed) — that is not reported as "up to date".
 
 To update, run `install.sh` again: it stops the service, replaces the package,
 installs the client and brings the service back up if it was running. Settings

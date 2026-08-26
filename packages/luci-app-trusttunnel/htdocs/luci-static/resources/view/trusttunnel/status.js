@@ -9,7 +9,9 @@ var callStatus = rpc.declare({ object: 'luci.trusttunnel', method: 'status' });
 var callService = rpc.declare({
 	object: 'luci.trusttunnel', method: 'service', params: [ 'action' ]
 });
-var callVersions = rpc.declare({ object: 'luci.trusttunnel', method: 'versions' });
+var callVersions = rpc.declare({
+	object: 'luci.trusttunnel', method: 'versions', params: [ 'refresh' ]
+});
 var callLog = rpc.declare({
 	object: 'luci.trusttunnel', method: 'log', params: [ 'lines' ]
 });
@@ -179,7 +181,8 @@ return view.extend({
 		return E('table', { 'class': 'table' }, rows);
 	},
 
-	renderVersions: function(v) {
+	renderVersions: function(v, box) {
+		var self = this;
 		var rows = [
 			row(_('Package'), v.package || _('unknown')),
 			row(_('TrustTunnel client'), v.client || _('not installed'))
@@ -196,13 +199,34 @@ return view.extend({
 				E('strong', {}, _('%s is available').format(v.latest)), ' — ',
 				_('run install.sh again to update')
 			])));
+		// Установленное новее последнего известного релиза — не «актуальная
+		// версия», а особый случай: либо сборка из main, либо кэш, который не
+		// удалось обновить. Своими словами, а не общим успокаивающим ответом.
+		else if (v.ahead)
+			rows.push(row(_('Update'),
+				_('the installed version is newer than the latest release (%s)').format(v.latest)));
 		else
 			rows.push(row(_('Update'), _('up to date')));
 
 		if (v.stale)
 			rows.push(row(_('Update check'), _('GitHub unreachable, showing the last cached result')));
 
-		return E('table', { 'class': 'table' }, rows);
+		// Кнопка обязательна именно потому, что ответ кэшируется: без неё
+		// единственный способ узнать о вышедшем релизе раньше, чем истечёт
+		// кэш, — перезагрузить роутер (кэш лежит в /var, то есть в tmpfs).
+		return E('div', {}, [
+			E('table', { 'class': 'table' }, rows),
+			E('div', { 'style': 'margin-top:.5em' }, E('button', {
+				'class': 'cbi-button cbi-button-neutral',
+				'click': ui.createHandlerFn(this, function() {
+					return callVersions(true).then(function(nv) {
+						dom.content(box, self.renderVersions(nv, box));
+					}).catch(function(e) {
+						ui.addNotification(null, E('p', {}, e.message || String(e)), 'danger');
+					});
+				})
+			}, _('Check now')))
+		]);
 	},
 
 	load: function() {
@@ -221,8 +245,8 @@ return view.extend({
 		// Версии запрашиваются ОДИН раз при отрисовке, а не через poll:
 		// сетевая часть кэшируется на сутки, и повторять даже кэшированный
 		// вызов каждые десять секунд незачем.
-		callVersions().then(function(v) {
-			dom.content(versionBox, self.renderVersions(v));
+		callVersions(false).then(function(v) {
+			dom.content(versionBox, self.renderVersions(v, versionBox));
 		}).catch(function(e) {
 			dom.content(versionBox, E('em', {}, e.message || String(e)));
 		});
