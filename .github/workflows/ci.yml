@@ -111,6 +111,50 @@ jobs:
           [ "$fail" = 0 ] && echo "every module function used is imported"
           exit "$fail"
 
+      # Проверка синтаксиса ucode. Раньше её делал release.yml, собирая
+      # host-ucode внутри контейнера SDK; переход на openwrt/gh-action-sdk эту
+      # возможность отнял — сборка целиком уехала внутрь действия. Без проверки
+      # синтаксическая ошибка в бэкенде уезжает в релиз незамеченной: это
+      # тысяча строк в ОДНОМ файле, который rpcd загружает целиком, и ошибка
+      # разбора выключает не одну функцию, а весь пакет.
+      #
+      # Проверка переехала СЮДА, а не осталась в релизной сборке, и от этого
+      # стала строже: теперь она идёт на каждый PR, а не раз в релиз.
+      #
+      # Компилятор собирается из исходников с модулями fs и math — ровно теми,
+      # что импортирует бэкенд. Это не украшательство: `ucode -c` разрешает
+      # импорты во время компиляции, и без math.so проверка падает прямо на
+      # строке `import { rand, srand } from 'math'` — то есть отвергает
+      # заведомо исправный файл. Проверено: без -DMATH_SUPPORT=ON шаг падает
+      # с кодом 255 на строке 10.
+      #
+      # Версия закреплена по той же причине, что и версия shellcheck:
+      # незакреплённый инструмент ломает сборку сам по себе в произвольный
+      # момент, при полностью неизменном коде.
+      - name: ucode syntax
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake libjson-c-dev pkg-config
+          git clone --depth 1 -b v0.0.20250529 https://github.com/jow-/ucode /tmp/ucode
+          cmake -S /tmp/ucode -B /tmp/ucode/build -DCMAKE_BUILD_TYPE=Release \
+            -DFS_SUPPORT=ON -DMATH_SUPPORT=ON \
+            -DUBUS_SUPPORT=OFF -DUCI_SUPPORT=OFF -DRTNL_SUPPORT=OFF \
+            -DNL80211_SUPPORT=OFF -DRESOLV_SUPPORT=OFF -DLOG_SUPPORT=OFF \
+            -DDEBUG_SUPPORT=OFF
+          cmake --build /tmp/ucode/build -j"$(nproc)"
+          uc=/tmp/ucode/build/ucode
+          "$uc" -L '/tmp/ucode/build/*.so' -c \
+            packages/luci-app-trusttunnel/root/usr/share/rpcd/ucode/luci.trusttunnel
+
+          # Контроль самой проверки: компилятор, принимающий заведомо битый
+          # файл, не проверяет ничего, а зелёный шаг при этом обманывает.
+          printf 'let x = ;\n' > /tmp/broken.uc
+          if "$uc" -L '/tmp/ucode/build/*.so' -c /tmp/broken.uc 2>/dev/null; then
+            echo "::error::the syntax check accepts broken input and proves nothing"
+            exit 1
+          fi
+          echo "ucode syntax ok"
+
       - name: JSON syntax
         run: |
           for f in $(find packages -name '*.json'); do
