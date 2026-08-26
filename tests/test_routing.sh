@@ -93,13 +93,41 @@ IPSTUB
 cat > "$stub/nft" <<'NFTSTUB'
 #!/bin/sh
 printf 'nft %s\n' "$*" >> "$TT_CMD_LOG"
+
+# Снимок уже накопленных адресов: им routing узнаёт, что перенести через
+# пересоздание таблицы. Пустая переменная означает "набора ещё нет" — то же,
+# что первая установка правил, и настоящий nft там тоже отвечает отказом.
+if [ "$1" = "list" ] && [ "$2" = "set" ]; then
+	case "$5" in
+		tt_bypass4) _e="${TT_FAKE_BYPASS4:-}" ;;
+		tt_bypass6) _e="${TT_FAKE_BYPASS6:-}" ;;
+		*)          _e="" ;;
+	esac
+	[ -n "$_e" ] || exit 1
+	printf 'table inet trusttunnel {\n\tset %s {\n\t\ttype ipv4_addr\n\t\telements = { %s }\n\t}\n}\n' "$5" "$_e"
+	exit 0
+fi
+
+# stdin читается ТОЛЬКО у `nft -f -`. Безусловный `cat` нельзя: nft вызывается
+# и без конвейера (`nft delete table …`), и тогда `cat` ждёт ввода вечно —
+# тестовый набор подвисает вместо того чтобы упасть, а зависание не
+# диагностируется.
+if [ "$1" = "-f" ] && [ "$2" = "-" ]; then
+	_batch=$(mktemp)
+	cat > "$_batch"
+	cat "$_batch" >> "${TT_NFT_STDIN:-/dev/null}"
+	# Отказ ровно на той порции, где есть перенос: так проверяется, что
+	# правила всё равно загрузятся, пусть и без накопленных адресов.
+	if [ "${TT_NFT_FAIL_ELEMENTS:-0}" = "1" ] &&
+		grep -q 'add element inet trusttunnel tt_bypass' "$_batch"; then
+		rm -f "$_batch"
+		echo "stub: carried-over elements rejected" >&2
+		exit 1
+	fi
+	rm -f "$_batch"
+fi
 exit 0
 NFTSTUB
-# Заглушка НЕ читает stdin. Слить его через `cat` нельзя: nft вызывается и
-# без конвейера (`nft delete table …`), и тогда `cat` ждёт ввода вечно —
-# тестовый набор подвисает вместо того чтобы упасть, а зависание не
-# диагностируется. Писателю в `dump_ruleset | nft -f -` при этом достаётся
-# EPIPE, что безвредно: код возврата конвейера берётся от заглушки.
 chmod +x "$stub/ip" "$stub/nft"
 export TT_CMD_LOG="$LOG"
 
@@ -128,6 +156,48 @@ assert_eq "0" "$(grep -c 'route replace default' "$LOG")" "up installs no defaul
 assert_contains "$up_log" "ip route replace blackhole default table 880 metric 1000" "up installs the killswitch blackhole route"
 assert_contains "$up_log" "ip rule add fwmark 0x9527 table 880 priority 30820" "up installs the fwmark rule"
 assert_contains "$up_log" "ip -6 rule add fwmark 0x9527 table 880 priority 30820" "up installs the ipv6 fwmark rule"
+
+# Наборы обхода наполняет dnsmasq по ответам DNS, а не мы: их содержимое и
+# есть то, по чему трафик попадает в туннель. Пересоздание таблицы обнуляло
+# их, и до следующего DNS-запроса помеченного трафика не существовало вовсе —
+# устройства держат адрес в своём кэше и продолжают ходить на него напрямую,
+# мимо туннеля и мимо blackhole. Проверено на живом роутере: сохранение
+# настроек уводило внешний адрес с адреса сервера на адрес провайдера.
+NFT_IN="$TT_TEST_TMP/nft.stdin"
+: > "$LOG"; : > "$NFT_IN"
+TT_NFT_STDIN="$NFT_IN" TT_FAKE_BYPASS4="1.1.1.1, 8.8.8.8" TT_FAKE_BYPASS6="2001:db8::1" \
+	TT_IP="$stub/ip" TT_NFT="$stub/nft" \
+	sh "$R" up "$TT_TEST_TMP/up.tsv" "$TT_TEST_TMP/nowhere" >/dev/null 2>&1
+carried="$(cat "$NFT_IN")"
+assert_contains "$carried" "add element inet trusttunnel tt_bypass4 { 1.1.1.1, 8.8.8.8 }" \
+	"up carries the accumulated bypass addresses across the table rebuild"
+assert_contains "$carried" "add element inet trusttunnel tt_bypass6 { 2001:db8::1 }" \
+	"same for ipv6"
+# Одной транзакцией с пересозданием, а не отдельным вызовом следом: между
+# `delete table` и отдельным `add element` набор пуст, и это ровно то окно,
+# ради закрытия которого перенос и делается.
+assert_eq "0" "$(grep -c 'add element inet trusttunnel tt_bypass' "$LOG")" \
+	"carries them inside the same nft transaction"
+assert_eq "0" "$(awk '/^table inet trusttunnel \{$/ { t = NR } /add element inet trusttunnel tt_bypass4/ { e = NR } END { print (t && e && t < e) ? 0 : 1 }' "$NFT_IN")" \
+	"the carried elements come after the table is recreated"
+
+# Первая установка: переносить нечего, и пустых `add element` быть не должно —
+# nft отверг бы такую строку и вместе с ней всю транзакцию.
+: > "$LOG"; : > "$NFT_IN"
+TT_NFT_STDIN="$NFT_IN" TT_IP="$stub/ip" TT_NFT="$stub/nft" \
+	sh "$R" up "$TT_TEST_TMP/up.tsv" "$TT_TEST_TMP/nowhere" >/dev/null 2>&1
+assert_eq "0" "$(grep -c 'add element' "$NFT_IN")" "nothing to carry on the first install"
+
+# Перенос — улучшение, а таблица правил — основа. Если ядро откажется принять
+# накопленные адреса, правила обязаны загрузиться без них: иначе одна
+# неудачная строка оставила бы роутер вообще без маркировки, то есть с полной
+# утечкой вместо частичной.
+: > "$LOG"; : > "$NFT_IN"
+TT_NFT_FAIL_ELEMENTS=1 TT_NFT_STDIN="$NFT_IN" TT_FAKE_BYPASS4="1.1.1.1" \
+	TT_IP="$stub/ip" TT_NFT="$stub/nft" \
+	sh "$R" up "$TT_TEST_TMP/up.tsv" "$TT_TEST_TMP/nowhere" >/dev/null 2>&1
+assert_eq "0" "$?" "a rejected carry-over does not fail the whole setup"
+assert_eq "2" "$(grep -c 'nft -f -' "$LOG")" "it retries the ruleset without the carried addresses"
 
 # attach — отдельная операция, которая и ставит маршрут, на устройство клиента.
 : > "$LOG"

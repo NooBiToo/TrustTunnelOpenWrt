@@ -211,6 +211,34 @@ add_endpoint_elements() {
 	done < "$1"
 }
 
+# Печатает элементы набора одной строкой ровно в том виде, в каком nft
+# принимает их обратно: "a, b, c-d". Пусто, если таблицы или набора ещё нет —
+# первая установка правил и есть этот случай.
+saved_bypass() {
+	$TT_NFT list set inet trusttunnel "$1" 2>/dev/null | awk '
+		/elements = \{/ { sub(/.*elements = \{/, ""); inside = 1 }
+		inside {
+			line = $0
+			if (sub(/\}.*$/, "", line)) { out = out line; found = 1; exit }
+			out = out line
+		}
+		END {
+			gsub(/[ \t]+/, " ", out)
+			gsub(/^ +| +$/, "", out)
+			if (found) print out
+		}
+	'
+}
+
+# Строки переноса накопленных адресов. Печатаются в ТОТ ЖЕ поток, что и
+# правила: отдельным вызовом следом между `delete table` и `add element`
+# оставалось бы окно с пустым набором, а закрывается здесь именно окно.
+carry_bypass() {
+	[ -n "$_keep4" ] && printf 'add element inet trusttunnel tt_bypass4 { %s }\n' "$_keep4"
+	[ -n "$_keep6" ] && printf 'add element inet trusttunnel tt_bypass6 { %s }\n' "$_keep6"
+	return 0
+}
+
 # Файл с именем устройства, которое создал КЛИЕНТ. Имя не наше и настройкой не
 # управляется: клиент выбирает его сам (tun0, дальше по возрастанию). Пишется
 # при attach, читается status и detach — иначе после перезапуска rpcd или
@@ -306,9 +334,28 @@ do_up() {
 	trap 'rm -f "$_ep_file"' EXIT INT TERM
 	resolve_endpoints > "$_ep_file"
 
-	_nft_err=$(dump_ruleset | $TT_NFT -f - 2>&1) || {
-		logger -t trusttunnel "error: nft -f (ruleset) failed: $_nft_err"
-		return 1
+	# Наборы обхода наполняет dnsmasq по ответам DNS, а не мы, и их содержимое
+	# и есть то, по чему трафик попадает в туннель. Пересоздание таблицы
+	# обнуляло их: до следующего DNS-запроса помеченного трафика не
+	# существовало вовсе, а устройства держат адрес в своём кэше и продолжают
+	# ходить на него — то есть напрямую, мимо туннеля и мимо blackhole.
+	# Обычное сохранение настроек само открывало ровно ту утечку, от которой
+	# пакет защищает. Проверено на живом роутере: до правки внешний адрес
+	# после Save & Apply уходил с адреса сервера на адрес провайдера.
+	_keep4=$(saved_bypass tt_bypass4)
+	_keep6=$(saved_bypass tt_bypass6)
+
+	_nft_err=$({ dump_ruleset; carry_bypass; } | $TT_NFT -f - 2>&1) || {
+		# Перенос — улучшение, таблица правил — основа. Отказ на одной
+		# строке переноса откатывает транзакцию целиком, и роутер остался бы
+		# вообще без маркировки: это полная утечка вместо частичной.
+		logger -t trusttunnel "warning: nft rejected the carried-over bypass addresses ($_nft_err); loading the ruleset without them"
+		_keep4=""
+		_keep6=""
+		_nft_err=$({ dump_ruleset; carry_bypass; } | $TT_NFT -f - 2>&1) || {
+			logger -t trusttunnel "error: nft -f (ruleset) failed: $_nft_err"
+			return 1
+		}
 	}
 	add_endpoint_elements "$_ep_file"
 
