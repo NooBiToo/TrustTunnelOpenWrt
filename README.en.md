@@ -27,6 +27,7 @@ stays direct.
 - [Limitations](#limitations)
 - [Updating](#updating)
 - [Uninstalling](#uninstalling)
+- [Donate](#donate)
 - [License and acknowledgements](#license-and-acknowledgements)
 
 ---
@@ -837,6 +838,37 @@ ip route show table 880           # no routes should remain
 Settings in `/etc/config/trusttunnel` remain after removing the package, so
 a reinstall does not lose your configuration. Remove the file by hand if
 you don't want that.
+
+---
+
+## Donate
+
+The package is free. If it helped you, you can support the development
+with crypto — addresses below.
+
+**TON**
+
+```
+UQD_JkHxRPrnkVPV560LT5zshYhe4ErkH-KALsKaNgPkJRmx
+```
+
+**Tron (TRC-20, e.g. USDT)**
+
+```
+TJCjmqQu5p8g9DbVPY7FdC59LvtZCcjFVn
+```
+
+**Ethereum / Polygon (EVM)** — one address for both networks:
+
+```
+0xd886FFA25b8816dDe1b7339D1ae2Ea4Ac9624b45
+```
+
+**Solana**
+
+```
+3XZGBNf2FuJ1ZKFrtWZXxLtfFKqxEVfW2JnmUuGtdqMx
+```
 
 ---
 
