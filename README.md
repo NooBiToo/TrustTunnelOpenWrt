@@ -866,6 +866,16 @@ ip route show table 880           # маршрутов не должно быт�
 
 ---
 
+## Ключевые слова
+
+OpenWrt, LuCI, TrustTunnel, VPN для роутера, VPN-клиент, обход блокировок,
+обход DPI, выборочный обход сайтов, split tunneling, selective routing,
+списки доменов, allow-domains, itdoginfo, podkop, dnsmasq, nftables, fwmark,
+killswitch, TUN, procd, apk, прошивка роутера, YouTube на роутере, Telegram,
+Discord, обход цензуры, установка одной командой
+
+---
+
 ## Лицензия и благодарности
 
 Пакет распространяется по лицензии **GPL-2.0**. Полный текст — в файле

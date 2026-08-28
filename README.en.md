@@ -840,6 +840,16 @@ you don't want that.
 
 ---
 
+## Keywords
+
+OpenWrt, LuCI, TrustTunnel, VPN client for router, DPI bypass, censorship
+circumvention, selective bypass, split tunneling, selective routing, domain
+lists, allow-domains, itdoginfo, podkop, dnsmasq, nftables, fwmark, killswitch,
+TUN, procd, apk, router firmware, YouTube in Russia, Telegram, Discord,
+one-command install
+
+---
+
 ## License and acknowledgements
 
 The package is distributed under the **GPL-2.0** license. Full text in
