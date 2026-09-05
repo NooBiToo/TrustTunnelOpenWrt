@@ -183,50 +183,76 @@ return view.extend({
 
 	renderVersions: function(v, box) {
 		var self = this;
-		var rows = [
-			row(_('Package'), v.package || _('unknown')),
-			row(_('TrustTunnel client'), v.client || _('not installed'))
-		];
 
+		// Компонентов два — пакет и клиент TrustTunnel, — и релизы у них
+		// независимые: клиент выходит у вендора, пакет здесь. Раньше вердикт
+		// «обновление / актуально» был один и относился только к пакету, а
+		// клиент лишь показывал номер, поэтому вышедший у вендора 1.1.5
+		// оставался невидимым при честном «актуальная версия» рядом. Теперь у
+		// каждого своя строка: версия и сразу за ней — что с ней.
+		//
 		// latest == null означает «проверить не удалось»: ни сети, ни кэша,
 		// либо у репозитория ещё нет ни одного релиза. Это НЕ то же самое,
 		// что «обновлений нет», и говорить об этом надо разными словами —
 		// иначе человек решит, что он на свежей версии, хотя проверки не было.
-		if (v.latest == null)
-			rows.push(row(_('Update check'), _('unavailable — no network and no cached result')));
-		else if (v.update_available)
-			rows.push(row(_('Update'), E('span', {}, [
-				E('strong', {}, _('%s is available').format(v.latest)), ' — ',
-				_('run install.sh again to update')
-			])));
-		// Установленное новее последнего известного релиза — не «актуальная
-		// версия», а особый случай: либо сборка из main, либо кэш, который не
-		// удалось обновить. Своими словами, а не общим успокаивающим ответом.
-		else if (v.ahead)
-			rows.push(row(_('Update'),
-				_('the installed version is newer than the latest release (%s)').format(v.latest)));
-		else
-			rows.push(row(_('Update'), _('up to date')));
+		// Установленное новее последнего известного релиза — тоже не
+		// «актуальная версия», а особый случай: либо сборка из main, либо
+		// кэш, который не удалось обновить. Своими словами, а не общим
+		// успокаивающим ответом.
+		function state(latest, upd, ahead) {
+			if (latest == null)
+				return E('em', {}, _('not checked'));
+			if (upd)
+				return E('strong', {}, _('%s is available').format(latest));
+			if (ahead)
+				return _('the installed version is newer than the latest release (%s)').format(latest);
+			return _('up to date');
+		}
+		function verRow(label, installed, missing, st) {
+			return row(label, installed
+				? E('span', {}, [ installed, ' — ', st ])
+				: E('em', {}, missing));
+		}
 
-		if (v.stale)
-			rows.push(row(_('Update check'), _('GitHub unreachable, showing the last cached result')));
+		var rows = [
+			verRow(_('Package'), v.package, _('unknown'),
+				state(v.latest, v.update_available, v.ahead)),
+			verRow(_('TrustTunnel client'), v.client, _('not installed'),
+				state(v.client_latest, v.client_update_available, v.client_ahead))
+		];
+
+		// Пояснения под таблицей — по одному на ситуацию, а не на компонент:
+		// install.sh обновляет обоих сразу, а «GitHub недоступен» относится к
+		// проверке целиком.
+		var notes = [];
+		if (v.update_available || v.client_update_available)
+			notes.push(_('Run install.sh again to update: it refreshes both the package and the client.'));
+		if (v.stale || v.client_stale)
+			notes.push(_('GitHub unreachable, showing the last cached result'));
+		if ((v.package && v.latest == null) || (v.client && v.client_latest == null))
+			notes.push(_('Update check unavailable: no network and no cached result'));
+
+		var parts = [ E('table', { 'class': 'table' }, rows) ];
+		if (notes.length)
+			parts.push(E('div', { 'style': 'margin-top:.5em' }, notes.map(function(t) {
+				return E('p', { 'style': 'margin:0' }, t);
+			})));
 
 		// Кнопка обязательна именно потому, что ответ кэшируется: без неё
 		// единственный способ узнать о вышедшем релизе раньше, чем истечёт
 		// кэш, — перезагрузить роутер (кэш лежит в /var, то есть в tmpfs).
-		return E('div', {}, [
-			E('table', { 'class': 'table' }, rows),
-			E('div', { 'style': 'margin-top:.5em' }, E('button', {
-				'class': 'cbi-button cbi-button-neutral',
-				'click': ui.createHandlerFn(this, function() {
-					return callVersions(true).then(function(nv) {
-						dom.content(box, self.renderVersions(nv, box));
-					}).catch(function(e) {
-						ui.addNotification(null, E('p', {}, e.message || String(e)), 'danger');
-					});
-				})
-			}, _('Check now')))
-		]);
+		parts.push(E('div', { 'style': 'margin-top:.5em' }, E('button', {
+			'class': 'cbi-button cbi-button-neutral',
+			'click': ui.createHandlerFn(this, function() {
+				return callVersions(true).then(function(nv) {
+					dom.content(box, self.renderVersions(nv, box));
+				}).catch(function(e) {
+					ui.addNotification(null, E('p', {}, e.message || String(e)), 'danger');
+				});
+			})
+		}, _('Check now'))));
+
+		return E('div', {}, parts);
 	},
 
 	load: function() {

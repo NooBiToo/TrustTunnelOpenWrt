@@ -284,12 +284,15 @@ cause is in the client log, not in the routing.
 
 ### Versions
 
-The bottom of the status page shows the installed package version, the
-TrustTunnel client version, and an update check against the repository
-releases. The check result is cached for six hours: GitHub allows 60
-unauthenticated requests per hour per address, and the page polls regularly.
-The "Check now" button asks GitHub immediately, without waiting for the cache
-to expire.
+The bottom of the status page shows the installed package version and the
+TrustTunnel client version, each with its own update check: the package is
+compared against this repository's releases, the client against the
+[TrustTunnelClient](https://github.com/TrustTunnel/TrustTunnelClient/releases)
+releases, because the client is released by the vendor independently of the
+package and a new version of one does not imply a new version of the other.
+The check result is cached for six hours: GitHub allows 60 unauthenticated
+requests per hour per address, and the page polls regularly. The "Check now"
+button asks GitHub immediately, without waiting for the cache to expire.
 
 The check distinguishes "no update" from "could not check" — the latter is
 shown as its own line. With no network it shows the last cached result, marked

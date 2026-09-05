@@ -486,12 +486,6 @@ msgstr "Клиент TrustTunnel"
 msgid "Latest release"
 msgstr "Последний выпуск"
 
-msgid "Update"
-msgstr "Обновление"
-
-msgid "Update check"
-msgstr "Проверка обновлений"
-
 msgid "unknown"
 msgstr "неизвестно"
 
@@ -507,8 +501,8 @@ msgstr "доступно обновление"
 msgid "re-run install.sh to update"
 msgstr "чтобы обновиться, запустите install.sh снова"
 
-msgid "unavailable — no network and no cached result"
-msgstr "недоступна — нет сети и нет сохранённого результата"
+msgid "Update check unavailable: no network and no cached result"
+msgstr "Проверка обновлений недоступна: нет сети и нет сохранённого результата"
 
 msgid "GitHub unreachable, showing the last cached result"
 msgstr "GitHub недоступен, показан последний сохранённый результат"
@@ -858,8 +852,8 @@ msgstr "%d снято списком «не обходить»"
 msgid "%s is available"
 msgstr "Доступна %s"
 
-msgid "run install.sh again to update"
-msgstr "чтобы обновиться, запустите install.sh снова"
+msgid "Run install.sh again to update: it refreshes both the package and the client."
+msgstr "Чтобы обновиться, запустите install.sh снова: он обновляет и пакет, и клиент."
 
 msgid "The service did not start. The client log below says why."
 msgstr "Служба не запустилась. Причина — в журнале клиента ниже."
