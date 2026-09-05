@@ -172,7 +172,10 @@ if it were a file makes it fail to parse outright.
 The fast path is **Import endpoint configuration**: paste the configuration
 text your TrustTunnel server generated, and the fields fill themselves in.
 Parsing is done by the client own `setup_wizard` utility, so exactly the
-formats TrustTunnel itself understands are supported.
+formats TrustTunnel itself understands are supported. The import takes every
+server field: addresses, host name, credentials, certificate, `custom_sni`,
+`client_random`, DNS servers, transport, and the anti-DPI and certificate
+verification flags.
 
 Filled in by hand:
 

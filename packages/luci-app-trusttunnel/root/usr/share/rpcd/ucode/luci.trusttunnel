@@ -1200,20 +1200,58 @@ return {
 				return { error: length(msg) ? join(" ", msg) : "setup_wizard failed" };
 			}
 
-			let res = { addresses: [] };
+			// Разбираются ВСЕ поля [endpoint], которые сервер может отдать.
+			// Раньше брались только hostname, учётные данные, сертификат и
+			// адреса, а custom_sni, client_random и dns_upstreams терялись.
+			// Потеря client_random не косметика: сервер с защитой от
+			// сканеров принимает только клиентов с этим префиксом, и без
+			// него импортированная конфигурация не подключается.
+			//
+			// Строка `ключ = значение`; заголовки секций и комментарии под
+			// шаблон не подходят и пропускаются. Значение разбирается по
+			// форме: строка в кавычках, массив в скобках, true/false.
+			// Строки берутся только непустыми — setup_wizard печатает пустые
+			// кавычки для незаданных полей.
+			function unquote(v) {
+				let m = match(v, /^"(.*)"$/);
+				return m ? m[1] : null;
+			}
+			function unlist(v) {
+				let m = match(v, /^\[(.*)\]$/);
+				if (!m) return null;
+				let out = [];
+				for (let a in split(m[1], ',')) {
+					a = replace(trim(a), /"/g, '');
+					if (length(a)) push(out, a);
+				}
+				return out;
+			}
+			function unbool(v) {
+				return v == 'true' ? '1' : (v == 'false' ? '0' : null);
+			}
+			let res = { addresses: [], dns_upstreams: [] };
 			for (let line in split(produced, '\n')) {
-				let m = match(line, /^ *hostname *= *"(.*)"/);
-				if (m) { res.hostname = m[1]; continue; }
-				m = match(line, /^ *username *= *"(.*)"/);
-				if (m) { res.username = m[1]; continue; }
-				m = match(line, /^ *password *= *"(.*)"/);
-				if (m) { res.password = m[1]; continue; }
-				m = match(line, /^ *certificate *= *"(.*)"/);
-				if (m) { res.certificate = m[1]; continue; }
-				m = match(line, /^ *addresses *= *\[(.*)\]/);
-				if (m) {
-					for (let a in split(m[1], ','))
-						push(res.addresses, replace(trim(a), /"/g, ''));
+				let kv = match(line, /^ *([a-z0-9_]+) *= *(.*)$/);
+				if (!kv) continue;
+				let k = kv[1], v = trim(kv[2]), s;
+				switch (k) {
+				case 'hostname': case 'username': case 'password':
+				case 'certificate': case 'custom_sni': case 'client_random':
+					s = unquote(v);
+					if (s != null && length(s)) res[k] = s;
+					break;
+				case 'upstream_protocol':
+					s = unquote(v);
+					if (s == 'http2' || s == 'http3') res.protocol = s;
+					break;
+				case 'has_ipv6': case 'skip_verification': case 'anti_dpi':
+					s = unbool(v);
+					if (s != null) res[k] = s;
+					break;
+				case 'addresses': case 'dns_upstreams':
+					s = unlist(v);
+					if (s != null) res[k] = s;
+					break;
 				}
 			}
 			// Если setup_wizard отработал, но НИ ОДНОГО поля распознать не

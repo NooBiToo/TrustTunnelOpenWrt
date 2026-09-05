@@ -140,6 +140,28 @@ return view.extend({
 							if (res.addresses && res.addresses.length)
 								uci.set('trusttunnel', 'endpoint', 'address', res.addresses);
 
+							// Остальные поля сервера. Флаг has_ipv6 берётся
+							// только положительным: setup_wizard печатает
+							// false и тогда, когда сервер поле не задал, —
+							// отличить «нет IPv6» от «не сказано» нельзя, а
+							// умолчание пакета («есть») безопаснее ошибочного
+							// «нет». У skip_verification и anti_dpi такой
+							// проблемы нет: их «не задано» и есть false.
+							if (res.custom_sni)
+								uci.set('trusttunnel', 'endpoint', 'custom_sni', res.custom_sni);
+							if (res.client_random)
+								uci.set('trusttunnel', 'endpoint', 'client_random', res.client_random);
+							if (res.protocol)
+								uci.set('trusttunnel', 'endpoint', 'protocol', res.protocol);
+							if (res.has_ipv6 == '1')
+								uci.set('trusttunnel', 'endpoint', 'has_ipv6', '1');
+							if (res.skip_verification != null)
+								uci.set('trusttunnel', 'endpoint', 'skip_verification', res.skip_verification);
+							if (res.anti_dpi != null)
+								uci.set('trusttunnel', 'endpoint', 'anti_dpi', res.anti_dpi);
+							if (res.dns_upstreams && res.dns_upstreams.length)
+								uci.set('trusttunnel', 'endpoint', 'dns_upstream', res.dns_upstreams);
+
 							// uci.set() держит изменения только в памяти
 							// браузера. Перезагрузка страницы их выбрасывает,
 							// поэтому прежний вариант (set + location.reload)
