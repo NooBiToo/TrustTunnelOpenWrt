@@ -47,6 +47,23 @@ password=$(tt_get endpoint.password)
 mtu=$(tt_get network.mtu 1350)
 loglevel=$(tt_get main.log_level info)
 protocol=$(tt_get endpoint.protocol http2)
+custom_sni=$(tt_get endpoint.custom_sni)
+client_random=$(tt_get endpoint.client_random)
+
+# Числовые ключи идут в TOML голыми числами. Мусор вместо числа сломал бы
+# разбор конфига целиком, и клиент не стартовал бы вовсе — поэтому всё, что
+# не целое неотрицательное число, заменяется значением по умолчанию.
+uint_or() { # uint_or <key> <default>
+	_v=$(tt_get "$1" "$2")
+	case "$_v" in
+		''|*[!0-9]*) printf '%s\n' "$2" ;;
+		*) printf '%s\n' "$_v" ;;
+	esac
+}
+preresolve_max=$(uint_or network.preresolve_max 50)
+tcp_recv_buf=$(uint_or network.tcp_recv_buf 0)
+tcp_send_buf=$(uint_or network.tcp_send_buf 0)
+scannable_ports=$(tt_get network.scannable_ports '443,80,8080,8008,853')
 
 # PEM выводится литеральной многострочной строкой TOML: апострофов в PEM быть
 # не может, поэтому экранирование не нужно. `awk 1` нормализует файл, добавляя
@@ -69,15 +86,24 @@ dns_upstreams=$(tt_list endpoint.dns_upstream | array_from_stdin)
 # домены выбранных списков, которые готовит вызывающая сторона.
 exclusions=$( { tt_list domains.direct; [ -n "$EXTRA" ] && [ -f "$EXTRA" ] && cat "$EXTRA"; } | array_from_stdin )
 
-# В [listener.tun] НЕТ ключей device_name и use_existing — раньше они здесь
-# генерировались, и это была ошибка. Сверено с эталоном, который выдаёт сам
-# setup_wizard: схема знает bound_if (интерфейс для ИСХОДЯЩИХ соединений
-# клиента, другое назначение), included_routes, excluded_routes, mtu_size и
-# change_system_dns. Выдуманные ключи клиент молча игнорировал и всегда
-# создавал СВОЁ устройство, а созданное нами оставалось без носителя: маршрут
-# в таблице 880 указывал в мёртвый интерфейс, помеченный трафик отбрасывался,
-# и при этом check_domain отвечал "verdict: tunnel". Теперь устройство создаёт
-# клиент, а маршрут к нему привязывается после старта (routing attach).
+# В [listener.tun] НЕТ ключей device_name и use_existing, и это намеренно.
+# История: раньше они здесь генерировались в расчёте на то, что клиент возьмёт
+# созданное нами устройство. Клиент 1.0.49 этих ключей не знал, молча
+# игнорировал их и всегда создавал СВОЁ устройство, а наше оставалось без
+# носителя: маршрут в таблице 880 указывал в мёртвый интерфейс, помеченный
+# трафик отбрасывался, и при этом check_domain отвечал "verdict: tunnel".
+# С клиента 1.0.62 ключи в схеме ЕСТЬ (сверено с эталоном setup_wizard 1.1.5
+# и с CHANGELOG вендора), но пакет ими по-прежнему не пользуется: устройство
+# создаёт клиент, а маршрут к нему привязывается после старта (routing
+# attach) — так одна и та же схема работает и на старых клиентах, которые
+# ключи игнорируют, и на новых.
+#
+# Ключи exclusions_* и tcp_*_buf_size появились в клиенте 1.0.63 и 1.1.5;
+# клиенты старше молча их игнорируют (проверено на 1.0.49). early-ack включён
+# по умолчанию ВОПРЕКИ дефолту клиента, по рекомендации вендора: режим нужен,
+# когда DNS резолвит не клиент (у нас — роутер) и для wildcard-исключений.
+# Проверено на стенде 5 сентября 2026: исключение обычного домена по SNI
+# срабатывает и без него, и на 1.0.49 тоже — это страховка, а не условие.
 #
 # included_routes и excluded_routes оставлены ПУСТЫМИ намеренно: маршрутизацию
 # держим мы — через отметку и таблицу 880. Отдать их клиенту означало бы
@@ -88,16 +114,20 @@ loglevel = "$(esc "$loglevel")"
 vpn_mode = "general"
 killswitch_enabled = false
 post_quantum_group_enabled = $(tt_bool endpoint.post_quantum 1)
-exclusions_tcp_early_ack_enabled = true
-exclusions_preresolve_enabled = true
+exclusions_tcp_early_ack_enabled = $(tt_bool network.early_ack 1)
+exclusions_preresolve_enabled = $(tt_bool network.preresolve 1)
+exclusions_preresolve_max_queries = ${preresolve_max}
+exclusions_scannable_ports = "$(esc "$scannable_ports")"
 exclusions = ${exclusions}
 
 [endpoint]
 hostname = "$(esc "$hostname")"
 addresses = ${addresses}
+custom_sni = "$(esc "$custom_sni")"
 has_ipv6 = $(tt_bool endpoint.has_ipv6 1)
 username = "$(esc "$username")"
 password = "$(esc "$password")"
+client_random = "$(esc "$client_random")"
 skip_verification = $(tt_bool endpoint.skip_verification 0)
 $(emit_certificate)
 upstream_protocol = "$(esc "$protocol")"
@@ -108,5 +138,7 @@ dns_upstreams = ${dns_upstreams}
 included_routes = []
 excluded_routes = []
 mtu_size = ${mtu}
+tcp_recv_buf_size = ${tcp_recv_buf}
+tcp_send_buf_size = ${tcp_send_buf}
 change_system_dns = false
 TOML

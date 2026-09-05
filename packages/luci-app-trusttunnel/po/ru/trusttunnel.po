@@ -1049,3 +1049,57 @@ msgstr "резолвит провайдер"
 
 msgid "dnsmasq has no encrypted upstream of its own, so every domain that is not in a selected list goes to the resolver handed out by the provider, which may return spoofed addresses. Install https-dns-proxy and start its service, or point dnsmasq at an encrypted resolver yourself."
 msgstr "У dnsmasq нет своего шифрованного upstream, поэтому каждый домен вне выбранных списков уходит к резолверу, выданному провайдером, а тот может отдавать подменённые адреса. Поставьте https-dns-proxy и запустите его сервис или сами направьте dnsmasq на шифрованный резолвер."
+
+msgid "Custom SNI"
+msgstr "Своё имя SNI"
+
+msgid "Sent in the TLS handshake instead of the host name. Needed only when your server configuration sets it; the import fills it in."
+msgstr "Передаётся в TLS-рукопожатии вместо имени хоста. Нужно только если задано в конфигурации сервера; импорт заполняет само."
+
+msgid "Client random prefix"
+msgstr "Префикс client random"
+
+msgid "Scanner-protection token issued by the server, a hex prefix with an optional /mask. Needed only when your server configuration sets it; the import fills it in."
+msgstr "Метка защиты сервера от сканеров: hex-префикс, при необходимости с /маской. Нужна только если задана в конфигурации сервера; импорт заполняет сам."
+
+msgid "Expected a hex string, optionally followed by /mask"
+msgstr "Ожидается hex-строка, при необходимости с /маской"
+
+msgid "Read the TLS server name before connecting"
+msgstr "Читать имя сервера TLS до соединения"
+
+msgid "Every TCP connection to the ports below first reveals which site it is for, so a domain from the \"do not bypass\" list goes out directly even when its address is in the bypass set. The vendor recommends this when DNS is resolved outside the client, as here, and for wildcard entries. Needs TrustTunnel client 1.1.5 or newer."
+msgstr "Каждое TCP-соединение на порты ниже сначала показывает, к какому сайту оно идёт, поэтому домен из списка «не обходить» уходит напрямую, даже когда его адрес попал в набор обхода. Вендор рекомендует это, когда DNS резолвит не клиент, как у нас, и для wildcard-записей. Нужен клиент TrustTunnel 1.1.5 или новее."
+
+msgid "Ports inspected for the server name"
+msgstr "Порты, где читается имя сервера"
+
+msgid "Comma-separated, ranges as 8080:8090. Connections to other ports are never matched against the \"do not bypass\" list."
+msgstr "Через запятую, диапазоны как 8080:8090. Соединения на другие порты со списком «не обходить» не сверяются."
+
+msgid "Expected ports or ranges separated by commas, e.g. 443,80,8080:8090"
+msgstr "Ожидаются порты или диапазоны через запятую, например 443,80,8080:8090"
+
+msgid "Pre-resolve \"do not bypass\" domains"
+msgstr "Заранее резолвить домены «не обходить»"
+
+msgid "The client resolves the excluded domains in the background right after start, so their addresses are known before the first connection."
+msgstr "Клиент разрешает домены-исключения в фоне сразу после старта, чтобы их адреса были известны до первого соединения."
+
+msgid "Pre-resolve at most"
+msgstr "Резолвить не более"
+
+msgid "Domains per pass. Matters with \"everything through VPN\" and thousands of excluded domains."
+msgstr "Доменов за проход. Имеет значение в режиме «всё через VPN» с тысячами доменов-исключений."
+
+msgid "TCP receive buffer, bytes"
+msgstr "Буфер приёма TCP, байт"
+
+msgid "Per connection inside the tunnel. 0 means the client default of 256 KB; lower it on routers with little memory, at the cost of throughput."
+msgstr "На каждое соединение внутри туннеля. 0 — умолчание клиента, 256 КБ; уменьшайте на роутерах с малой памятью ценой скорости."
+
+msgid "TCP send buffer, bytes"
+msgstr "Буфер передачи TCP, байт"
+
+msgid "Per connection inside the tunnel. 0 means the client default of 256 KB."
+msgstr "На каждое соединение внутри туннеля. 0 — умолчание клиента, 256 КБ."

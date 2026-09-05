@@ -14,8 +14,16 @@ endpoint.skip_verification	1
 endpoint.has_ipv6	0
 endpoint.dns_upstream	tls://1.1.1.1
 endpoint.dns_upstream	quic://dns.adguard.com:8853
+endpoint.client_random	a1b2c3d4/ffffffff
+endpoint.custom_sni	cdn.example.net
 network.device	tt0
 network.mtu	1400
+network.early_ack	0
+network.preresolve	0
+network.preresolve_max	10
+network.scannable_ports	443,8443:8450
+network.tcp_recv_buf	131072
+network.tcp_send_buf	65536
 network.table	880
 network.fwmark	0x9527
 network.blackhole_on_down	1

@@ -643,12 +643,19 @@ by hand** — they are overwritten on every start.
 | `certificate` | — | Pinned certificate, PEM format |
 | `has_ipv6` | `1` | Whether the endpoint speaks IPv6 |
 | `dns_upstream` | — | DNS servers for queries inside the tunnel. Empty means unfiltered AdGuard DNS |
+| `custom_sni` | — | Name sent in the TLS handshake instead of `hostname`, when the server is set up that way |
+| `client_random` | — | Client random prefix for the server's scanner protection, `hex[/mask]`; such a server rejects clients without it |
 
 ### `network` section
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `mtu` | `1350` | MTU on the device |
+| `early_ack` | `1` | Read the SNI before the connection is made: the vendor's recommendation with external DNS and wildcard exclusions. Client 1.1.5+ |
+| `scannable_ports` | `443,80,8080,8008,853` | Ports where the SNI is read; a range is `8080:8090` |
+| `preresolve` | `1` | Resolve excluded domains ahead of time, in the background |
+| `preresolve_max` | `50` | How many exclusions to pre-resolve per pass |
+| `tcp_recv_buf`, `tcp_send_buf` | `0` | TCP window buffers per connection inside the tunnel, bytes; `0` is the client's 256 KB. Client 1.0.63+ |
 | `table` | `880` | Routing table |
 | `fwmark` | `0x9527` | Firewall mark |
 | `lan_devices` | — | Interfaces whose forwarded traffic is considered. Empty takes the `lan` network's device. Set explicitly if you have a guest network |

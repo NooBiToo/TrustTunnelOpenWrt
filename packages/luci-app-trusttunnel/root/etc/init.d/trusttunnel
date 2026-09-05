@@ -810,7 +810,11 @@ change_class() {
 		# Остальное уходит в client.toml, а его клиент читает один раз при
 		# запуске. endpoint.* перечислен шаблоном намеренно: в этой секции
 		# нет и не может появиться значения, не попадающего в конфиг клиента.
-		main.mode|main.full_exclude_lists|main.log_level|network.mtu|endpoint.*)
+		# Настройки исключений и буферов TCP самого клиента — тоже client.toml.
+		main.mode|main.full_exclude_lists|main.log_level|network.mtu|\
+		network.early_ack|network.preresolve|network.preresolve_max|\
+		network.scannable_ports|network.tcp_recv_buf|network.tcp_send_buf|\
+		endpoint.*)
 			printf 'restart\n' ;;
 		*)
 			printf 'restart_full\n' ;;

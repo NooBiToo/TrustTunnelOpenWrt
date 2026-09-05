@@ -35,7 +35,7 @@ for o in enabled mode full_exclude_lists log_level; do scalar main "$o"; done
 # в records не может содержать перевод строки. Сертификат пишет в отдельный
 # файл init-скрипт и передаёт его gen-config третьим аргументом.
 for o in hostname username password protocol anti_dpi post_quantum \
-		skip_verification has_ipv6; do
+		skip_verification has_ipv6 custom_sni client_random; do
 	scalar endpoint "$o"
 done
 listopt endpoint address
@@ -45,9 +45,12 @@ listopt endpoint dns_upstream
 # настройки не существует. "tunnel_list_dns" заменён на "list_dns": флаг
 # «включать ли свой резолвер» и тип резолвера могли противоречить друг другу,
 # теперь это одно поле с тремя значениями — provider, plain, doh.
+# early_ack … tcp_send_buf — настройки самого клиента (появились в нём в
+# 1.0.63 и 1.1.5), gen-config переносит их в client.toml как есть.
 for o in mtu table fwmark blackhole_on_down include_router_traffic \
 		intercept_dns list_dns list_resolver list_doh_url list_doh_port \
-		doh_network lan_devices; do
+		doh_network lan_devices early_ack preresolve preresolve_max \
+		scannable_ports tcp_recv_buf tcp_send_buf; do
 	scalar network "$o"
 done
 

@@ -360,12 +360,33 @@ return view.extend({
 		o.datatype = 'hostname';
 		o.rmempty = false;
 
+		// Два поля ниже нужны только тогда, когда их выдал сервер, — поэтому
+		// они необязательные и заполняются импортом. custom_sni подменяет имя
+		// в TLS-рукопожатии (маскировка под другой домен), client_random —
+		// метка защиты сервера от сканеров: без неё такой сервер принимает
+		// клиента за сканер и не пускает.
+		o = s.option(form.Value, 'custom_sni', _('Custom SNI'),
+			_('Sent in the TLS handshake instead of the host name. Needed only when your server configuration sets it; the import fills it in.'));
+		o.datatype = 'hostname';
+		o.optional = true;
+		o.placeholder = 'cdn.example.net';
+
 		o = s.option(form.Value, 'username', _('User name'));
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'password', _('Password'));
 		o.password = true;
 		o.rmempty = false;
+
+		o = s.option(form.Value, 'client_random', _('Client random prefix'),
+			_('Scanner-protection token issued by the server, a hex prefix with an optional /mask. Needed only when your server configuration sets it; the import fills it in.'));
+		o.optional = true;
+		o.placeholder = 'a1b2c3d4/ffffffff';
+		o.validate = function(section_id, value) {
+			if (!value || /^[0-9a-fA-F]+(\/[0-9a-fA-F]+)?$/.test(value))
+				return true;
+			return _('Expected a hex string, optionally followed by /mask');
+		};
 
 		o = s.option(form.ListValue, 'protocol', _('Transport'));
 		o.value('http2', 'HTTP/2');
@@ -503,6 +524,48 @@ return view.extend({
 		o = s.option(form.Value, 'mtu', _('MTU'));
 		o.datatype = 'range(576,9000)';
 		o.default = '1350';
+
+		// Настройки исключений самого клиента. Появились в клиенте 1.1.5;
+		// старший их не знает и молча игнорирует — об этом предупреждает
+		// диагностика. early-ack включён ВОПРЕКИ дефолту клиента по
+		// рекомендации вендора: он нужен, когда DNS резолвит не клиент (наш
+		// случай) и для wildcard-записей. На стенде исключение по SNI
+		// срабатывало и без него, так что это страховка, а не условие.
+		o = s.option(form.Flag, 'early_ack', _('Read the TLS server name before connecting'),
+			_('Every TCP connection to the ports below first reveals which site it is for, so a domain from the "do not bypass" list goes out directly even when its address is in the bypass set. The vendor recommends this when DNS is resolved outside the client, as here, and for wildcard entries. Needs TrustTunnel client 1.1.5 or newer.'));
+		o.default = '1';
+
+		o = s.option(form.Value, 'scannable_ports', _('Ports inspected for the server name'),
+			_('Comma-separated, ranges as 8080:8090. Connections to other ports are never matched against the "do not bypass" list.'));
+		o.default = '443,80,8080,8008,853';
+		o.placeholder = '443,80,8080,8008,853';
+		o.validate = function(section_id, value) {
+			if (!value || /^[0-9]+(:[0-9]+)?(,[0-9]+(:[0-9]+)?)*$/.test(value))
+				return true;
+			return _('Expected ports or ranges separated by commas, e.g. 443,80,8080:8090');
+		};
+
+		o = s.option(form.Flag, 'preresolve', _('Pre-resolve "do not bypass" domains'),
+			_('The client resolves the excluded domains in the background right after start, so their addresses are known before the first connection.'));
+		o.default = '1';
+
+		o = s.option(form.Value, 'preresolve_max', _('Pre-resolve at most'),
+			_('Domains per pass. Matters with "everything through VPN" and thousands of excluded domains.'));
+		o.datatype = 'uinteger';
+		o.default = '50';
+		o.depends('preresolve', '1');
+
+		// Буферы TCP-окна внутри туннеля. Дефолт клиента 256 КБ на
+		// соединение — заметная величина для роутера с 128 МБ памяти.
+		o = s.option(form.Value, 'tcp_recv_buf', _('TCP receive buffer, bytes'),
+			_('Per connection inside the tunnel. 0 means the client default of 256 KB; lower it on routers with little memory, at the cost of throughput.'));
+		o.datatype = 'uinteger';
+		o.default = '0';
+
+		o = s.option(form.Value, 'tcp_send_buf', _('TCP send buffer, bytes'),
+			_('Per connection inside the tunnel. 0 means the client default of 256 KB.'));
+		o.datatype = 'uinteger';
+		o.default = '0';
 
 		o = s.option(form.Value, 'lan_devices', _('LAN interfaces'),
 			_('Space-separated list whose forwarded traffic is considered. Empty means the device of the lan network.'));

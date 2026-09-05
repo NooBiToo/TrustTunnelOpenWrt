@@ -15,6 +15,13 @@ const LIBDIR = '/usr/libexec/trusttunnel';
 const OUTDIR = '/var/etc/trusttunnel';
 const RECORDS = OUTDIR + '/settings.tsv';
 const CLIENT = '/opt/trusttunnel_client/trusttunnel_client';
+// Минимальная версия клиента, на которой действуют настройки исключений и
+// буферов TCP (ключи exclusions_* и tcp_*_buf_size в client.toml). Более
+// старый клиент молча их игнорирует: интерфейс показывает настройку, а
+// работает умолчание клиента. Сам список «не обходить» на 1.0.49 работает
+// (проверено на стенде 5 сентября 2026: исключение по SNI уходит напрямую),
+// поэтому в диагностике это warn, а не отказ.
+const CLIENT_MIN = '1.1.5';
 const CACHE = '/var/cache/trusttunnel/catalog.json';
 // Метка времени обновления списков лежит на ПОСТОЯННОЙ памяти рядом со
 // списками, а не в OUTDIR: тот находится в /var, который на OpenWrt является
@@ -762,9 +769,15 @@ return {
 				let m = match(trim(r.out), /([0-9]+\.[0-9]+\.[0-9]+[^ \t\n]*)/);
 				clver = m ? m[1] : 'installed';
 			}
-			add('prereq', 'TrustTunnel client', cl ? 'ok' : 'fail',
+			// Старый клиент — warn, а не fail: и туннель, и список «не
+			// обходить» на нём работают; не действуют только настройки
+			// исключений и буферов TCP со вкладки «Сеть».
+			let cl_old = cl && clver != 'installed' && vercmp(clver, CLIENT_MIN) < 0;
+			add('prereq', 'TrustTunnel client', !cl ? 'fail' : (cl_old ? 'warn' : 'ok'),
 				cl ? clver : 'not installed',
-				cl ? '' : 'Run install.sh — the package does not ship the client binary.');
+				!cl ? 'Run install.sh — the package does not ship the client binary.'
+				    : (cl_old ? 'Older than ' + CLIENT_MIN + ': the exclusion and TCP buffer settings on the Network tab have no effect on this client. Run install.sh again to update it.'
+				              : ''));
 
 			let nft_ok = dnsmasq_has_nftset();
 			add('prereq', 'dnsmasq nftset support', nft_ok ? 'ok' : (mode == 'full' ? 'warn' : 'fail'),
