@@ -79,7 +79,9 @@ sh -c "$(wget -O - https://raw.githubusercontent.com/NooBiToo/TrustTunnelOpenWrt
    подтверждение на установку `dnsmasq-full`.
 4. Скачивает `luci-app-trusttunnel-*.apk` из последнего релиза и ставит его.
 5. Определяет архитектуру и ставит бинарник клиента официальным скриптом
-   TrustTunnel в `/opt/trusttunnel_client`.
+   TrustTunnel в `/opt/trusttunnel_client` — последний релиз клиента, а не
+   версию, зашитую в скрипт вендора. Закрепить версию можно переменной
+   `TT_CLIENT_VERSION=1.1.5` перед командой установки.
 6. Перезапускает `rpcd`, чтобы LuCI увидел новый бэкенд.
 
 Скрипт идемпотентен: повторный запуск обновляет пакет и бинарник, не трогая

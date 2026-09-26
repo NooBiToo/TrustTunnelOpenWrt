@@ -83,7 +83,9 @@ What the script does:
 4. Downloads `luci-app-trusttunnel-*.apk` from the latest release and
    installs it.
 5. Detects the architecture and installs the client binary with
-   TrustTunnel's own installer script into `/opt/trusttunnel_client`.
+   TrustTunnel's own installer script into `/opt/trusttunnel_client` — the
+   latest client release, not the version hard-coded in the vendor's script.
+   To pin a version, put `TT_CLIENT_VERSION=1.1.5` before the install command.
 6. Restarts `rpcd` so LuCI picks up the new backend.
 
 The script is idempotent: running it again updates the package and the

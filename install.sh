@@ -6,6 +6,7 @@ set -e
 REPO="${TT_REPO:-NooBiToo/TrustTunnelOpenWrt}"
 CLIENT_DIR=/opt/trusttunnel_client
 CLIENT_INSTALLER=https://raw.githubusercontent.com/TrustTunnel/TrustTunnelClient/refs/heads/master/scripts/install.sh
+CLIENT_RELEASE=https://api.github.com/repos/TrustTunnel/TrustTunnelClient/releases/latest
 
 say()  { printf '%s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -154,7 +155,27 @@ mkdir -p "$CLIENT_DIR"
 # установщик там повиснет, а в неинтерактивном окружении (запуск из скрипта
 # или из cron) чтение из /dev/tty ещё и недоступно вовсе. Ответ «да» здесь
 # правдив: службу мы остановили выше, до подмены бинарника.
-curl -fsSL "$CLIENT_INSTALLER" | sh -s - -a y -o "$CLIENT_DIR"
+#
+# Версия передаётся явно (-V) из последнего релиза вендора. Без неё установщик
+# ставит зашитую в него версию, а вендор перестал её поднимать: и в master, и
+# в теге v1.1.7 там по-прежнему 1.1.5. Выходило, что страница состояния
+# предлагает 1.1.7, а повторный install.sh снова ставит 1.1.5 — тот, что
+# падает на роутерах без IPv6 (TrustTunnelClient#92). TT_CLIENT_VERSION
+# закрепляет версию вручную, например для отката. Если GitHub API не ответил,
+# остаётся версия установщика: старый клиент лучше, чем никакого.
+client_ver=${TT_CLIENT_VERSION:-}
+if [ -z "$client_ver" ]; then
+	client_ver=$(curl -fsSL "$CLIENT_RELEASE" 2>/dev/null \
+		| sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+fi
+client_ver=${client_ver#v}
+if [ -n "$client_ver" ]; then
+	say "   version $client_ver"
+	curl -fsSL "$CLIENT_INSTALLER" | sh -s - -a y -o "$CLIENT_DIR" -V "$client_ver"
+else
+	say "warning: cannot find the latest client release; installing the version the vendor installer defaults to"
+	curl -fsSL "$CLIENT_INSTALLER" | sh -s - -a y -o "$CLIENT_DIR"
+fi
 [ -x "$CLIENT_DIR/trusttunnel_client" ] || die "client binary was not installed"
 
 say "== Restarting LuCI backend"
