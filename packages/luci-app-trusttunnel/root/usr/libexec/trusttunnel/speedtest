@@ -1,0 +1,295 @@
+#!/bin/sh
+# Замер скорости: пинг, загрузка и отдача — напрямую и через туннель.
+# Использование:
+#   speedtest start  <dir> <tunnel-dev|->   запустить в фоне и сразу вернуться
+#   speedtest status <dir>                  состояние в виде "ключ<TAB>значение"
+#   speedtest stop   <dir>                  прервать
+#   speedtest run    <dir> <tunnel-dev|->   то же, что start, но в этом процессе
+#
+# Замер идёт около 40 секунд, а обычный вызов rpcd столько не живёт и не умеет
+# отдавать промежуточные значения. Поэтому замер работает в фоне и пишет
+# состояние в файл, а страница опрашивает status и двигает стрелку.
+#
+# Что и как меряется — по образцу speedtest.net:
+#  * несколько параллельных потоков: один поток TCP на канале с большой
+#    задержкой не набирает скорость, и число выходит заниженным. Проверено на
+#    стенде: один поток через туннель давал ~78 Мбит/с, восемь — заметно
+#    больше;
+#  * пинг — это время ответа на пустой HTTPS-запрос (HTTP-пинг), а не ICMP.
+#    Через туннель ICMP не проходит (проверено: 100% потерь), а TCP connect
+#    врёт — клиент туннеля завершает соединение локально, и выходит ~1 мс.
+#    Поэтому берётся время от конца TLS-рукопожатия до первого байта ответа:
+#    рукопожатие идёт сквозь туннель до сервера, значит, этот интервал — один
+#    настоящий круг туда и обратно.
+#  * jitter — среднее отклонение соседних замеров пинга.
+#
+# Живая скорость для стрелки берётся из счётчиков интерфейса и потому
+# приблизительна: она видит и чужой трафик сети. Итог считается по данным самих
+# curl, только по тестовому трафику.
+set -u
+
+# Всё переопределяется из окружения по тому же образцу, что TT_IP и TT_NFT в
+# routing: без этого замер нечем покрыть тестами на машине разработчика.
+TT_CURL="${TT_CURL:-curl}"
+TT_IP="${TT_IP:-ip}"
+TT_SYSFS="${TT_SYSFS:-/sys/class/net}"
+TT_SPEEDTEST_URL="${TT_SPEEDTEST_URL:-https://speed.cloudflare.com}"
+TT_SPEEDTEST_SECS="${TT_SPEEDTEST_SECS:-8}"
+TT_SPEEDTEST_STREAMS="${TT_SPEEDTEST_STREAMS:-4}"
+TT_SPEEDTEST_PINGS="${TT_SPEEDTEST_PINGS:-10}"
+TT_SPEEDTEST_TICK="${TT_SPEEDTEST_TICK:-0.5}"
+# Один запрос на скачивание и один пакет на отдачу. Cloudflare отвергает
+# bytes больше ~100 МБ (отдаёт один байт вместо данных), а 25 МБ хватает, чтобы
+# поток не кончился раньше срока даже на быстром канале.
+CHUNK=25000000
+PAYLOAD_KB=8192
+
+TAB="$(printf '\t')"
+
+CMD="${1:-}"
+DIR="${2:-}"
+[ -n "$CMD" ] && [ -n "$DIR" ] || {
+	echo "usage: speedtest start|status|stop|run <dir> [tunnel-dev|-]" >&2
+	exit 2
+}
+STATE="$DIR/state.tsv"
+PIDFILE="$DIR/pid"
+
+# Ключ в состоянии заменяется целиком, файл подменяется атомарно: страница
+# читает его в любой момент и не должна увидеть половину записи.
+put() {
+	grep -v "^$1$TAB" "$STATE" > "$STATE.new" 2>/dev/null
+	printf '%s\t%s\n' "$1" "$2" >> "$STATE.new"
+	mv "$STATE.new" "$STATE"
+}
+
+is_running() {
+	[ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+# --- status --------------------------------------------------------------------
+cmd_status() {
+	if [ ! -f "$STATE" ]; then
+		printf 'phase\tidle\nrunning\t0\n'
+		return 0
+	fi
+	cat "$STATE"
+	[ -f "$DIR/live" ] && printf 'live\t%s\n' "$(cat "$DIR/live")"
+	if is_running; then
+		printf 'running\t1\n'
+	else
+		printf 'running\t0\n'
+		# Процесс умер, не дописав итоговую фазу (убит, перезагрузка службы):
+		# без этой пометки страница ждала бы вечно.
+		case "$(awk -F'\t' '$1 == "phase" { v = $2 } END { print v }' "$STATE")" in
+			done|stopped|error) ;;
+			*) printf 'error\tinterrupted\n' ;;
+		esac
+	fi
+}
+
+# --- stop ----------------------------------------------------------------------
+cmd_stop() {
+	is_running && kill "$(cat "$PIDFILE")" 2>/dev/null
+	return 0
+}
+
+# --- start ---------------------------------------------------------------------
+cmd_start() {
+	TUN="${3:--}"
+	if is_running; then
+		echo "error: already running"
+		return 1
+	fi
+	mkdir -p "$DIR" && chmod 700 "$DIR" || return 1
+	rm -f "$STATE" "$DIR/live" "$DIR"/stream.*
+	# Тело для отдачи — нули из файла: curl читает --data-binary @- целиком
+	# в память, а файл общий для всех потоков и лежит на tmpfs.
+	[ -s "$DIR/payload" ] ||
+		dd if=/dev/zero of="$DIR/payload" bs=1024 count="$PAYLOAD_KB" 2>/dev/null
+	put phase starting
+	# Свои stdout/stderr закрываем: вызывающий (popen в rpcd) читает вывод до
+	# конца, и фоновый процесс с открытым каналом подвесил бы его.
+	sh "$0" run "$DIR" "$TUN" </dev/null >/dev/null 2>&1 &
+	echo $! > "$PIDFILE"
+	echo started
+}
+
+# --- измерения -----------------------------------------------------------------
+
+# Пинг: TT_SPEEDTEST_PINGS последовательных запросов, каждый на новом
+# соединении. Печатает "медиана jitter" в миллисекундах или ничего, если
+# ответа не было ни разу.
+measure_ping() {
+	: > "$DIR/ping.samples"
+	i=0
+	while [ "$i" -lt "$TT_SPEEDTEST_PINGS" ]; do
+		# shellcheck disable=SC2086
+		t=$($TT_CURL -s -o /dev/null -m 5 $BIND \
+			-w '%{time_appconnect} %{time_starttransfer}' \
+			"$TT_SPEEDTEST_URL/__down?bytes=0") || true
+		echo "$t" >> "$DIR/ping.samples"
+		i=$((i + 1))
+	done
+	awk '
+		NF == 2 && $1 > 0 && $2 > $1 { n++; v[n] = ($2 - $1) * 1000 }
+		END {
+			if (n == 0) exit 1
+			# jitter считается по порядку замеров, до сортировки.
+			j = 0
+			for (k = 2; k <= n; k++) j += (v[k] > v[k-1] ? v[k] - v[k-1] : v[k-1] - v[k])
+			j = (n > 1) ? j / (n - 1) : 0
+			for (a = 2; a <= n; a++) {
+				x = v[a]; b = a - 1
+				while (b >= 1 && v[b] > x) { v[b+1] = v[b]; b-- }
+				v[b+1] = x
+			}
+			m = (n % 2) ? v[(n+1)/2] : (v[n/2] + v[n/2+1]) / 2
+			printf "%.1f %.1f\n", m, j
+		}' "$DIR/ping.samples"
+}
+
+# Секунды с долями из /proc/uptime: date +%s даёт целые, а живая скорость
+# считается по интервалам в полсекунды.
+uptime_s() { read -r up _ < "${TT_UPTIME:-/proc/uptime}" && echo "$up"; }
+
+# Один поток: гоняет запросы, пока не истечёт срок, и пишет суммарные байты в
+# файл. Каждый запрос ограничен оставшимся временем (-m), поэтому curl обрывает
+# сам себя, а при обрыве -w всё равно печатает переданное.
+stream() {
+	n="$1"; dir="$2"; end="$3"
+	total=0
+	while :; do
+		left=$((end - $(date +%s)))
+		[ "$left" -lt 1 ] && break
+		if [ "$dir" = down ]; then
+			# shellcheck disable=SC2086
+			b=$($TT_CURL -s -o /dev/null -m "$left" $BIND -w '%{size_download}' \
+				"$TT_SPEEDTEST_URL/__down?bytes=$CHUNK") || true
+		else
+			# Expect: старый curl ждёт «100 Continue» секунду на любом теле
+			# больше мегабайта.
+			# shellcheck disable=SC2086
+			b=$($TT_CURL -s -o /dev/null -m "$left" $BIND -H 'Expect:' \
+				--data-binary "@$DIR/payload" -w '%{size_upload}' \
+				"$TT_SPEEDTEST_URL/__up") || true
+		fi
+		case "$b" in ''|*[!0-9]*) b=0 ;; esac
+		total=$((total + b))
+		# Мгновенный отказ (нет сети) не должен превращаться в бешеный цикл.
+		[ "$b" -eq 0 ] && sleep 1
+	done
+	echo "$total" > "$DIR/stream.$n"
+}
+
+# Замер направления dir (down|up). Печатает итог в Мбит/с. По ходу пишет
+# в $DIR/live текущую скорость по счётчику интерфейса $CDEV.
+measure_transfer() {
+	dir="$1"
+	if [ "$dir" = down ]; then ctr=rx_bytes; else ctr=tx_bytes; fi
+	f="$TT_SYSFS/$CDEV/statistics/$ctr"
+
+	rm -f "$DIR"/stream.*
+	t0=$(uptime_s)
+	end=$(( $(date +%s) + TT_SPEEDTEST_SECS ))
+	PIDS=""
+	n=1
+	while [ "$n" -le "$TT_SPEEDTEST_STREAMS" ]; do
+		stream "$n" "$dir" "$end" &
+		PIDS="$PIDS $!"
+		n=$((n + 1))
+	done
+
+	prev=""; prev_t=""
+	alive=1
+	while [ "$alive" = 1 ]; do
+		alive=0
+		for p in $PIDS; do
+			kill -0 "$p" 2>/dev/null && alive=1
+		done
+		if [ -n "$CDEV" ] && [ -r "$f" ]; then
+			cur=$(cat "$f"); now=$(uptime_s)
+			if [ -n "$prev" ]; then
+				awk -v a="$prev" -v b="$cur" -v ta="$prev_t" -v tb="$now" 'BEGIN {
+					dt = tb - ta; d = b - a
+					printf "%.1f\n", (dt > 0 && d > 0) ? d * 8 / 1000000 / dt : 0 }' \
+					> "$DIR/live.tmp" && mv "$DIR/live.tmp" "$DIR/live"
+			fi
+			prev="$cur"; prev_t="$now"
+		fi
+		[ "$alive" = 1 ] && sleep "$TT_SPEEDTEST_TICK"
+	done
+	wait
+	PIDS=""
+	t1=$(uptime_s)
+
+	total=0
+	for s in "$DIR"/stream.*; do
+		[ -f "$s" ] && total=$((total + $(cat "$s")))
+	done
+	awk -v b="$total" -v a="$t0" -v c="$t1" 'BEGIN {
+		dt = c - a
+		printf "%.1f\n", (dt > 0) ? b * 8 / 1000000 / dt : 0 }'
+}
+
+# Устройство, которым уходит обычный трафик роутера: по нему считается живая
+# скорость прямого замера. Пусто, если найти не удалось — тогда стрелка стоит
+# на нуле, а итог от этого не страдает.
+wan_device() {
+	$TT_IP -4 route show default 2>/dev/null |
+		awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+# Один проход по пути: пинг, загрузка, отдача. Результаты кладутся под ключами
+# "<путь>.ping" и т. д.
+measure_path() {
+	via="$1"
+	if [ "$via" = tunnel ]; then
+		BIND="--interface $TUN"; CDEV="$TUN"
+	else
+		BIND=""; CDEV=$(wan_device)
+	fi
+	put via "$via"
+	rm -f "$DIR/live"
+
+	put phase ping
+	r=$(measure_ping) || r=""
+	if [ -n "$r" ]; then
+		put "$via.ping" "${r% *}"
+		put "$via.jitter" "${r#* }"
+	fi
+
+	put phase download
+	put "$via.down" "$(measure_transfer down)"
+	rm -f "$DIR/live"
+
+	put phase upload
+	put "$via.up" "$(measure_transfer up)"
+	rm -f "$DIR/live"
+}
+
+cmd_run() {
+	TUN="${3:--}"
+	PIDS=""
+	# Оборванный замер: потоки завершаются сами, самое позднее по истечении
+	# срока curl -m, поэтому достаточно остановить те, что держит этот
+	# процесс, и честно записать, что замер прерван.
+	trap 'for p in $PIDS; do kill "$p" 2>/dev/null; done; put phase stopped; exit 0' TERM INT
+
+	measure_path direct
+	if [ "$TUN" = "-" ]; then
+		put tunnel.skipped 1
+	else
+		measure_path tunnel
+	fi
+	put phase done
+	rm -f "$DIR/live"
+}
+
+case "$CMD" in
+	start)  cmd_start "$@" ;;
+	status) cmd_status ;;
+	stop)   cmd_stop ;;
+	run)    cmd_run "$@" ;;
+	*)      echo "usage: speedtest start|status|stop|run <dir> [tunnel-dev|-]" >&2; exit 2 ;;
+esac

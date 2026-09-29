@@ -64,6 +64,7 @@ define Build/Compile
 	chmod 0755 $(PKG_BUILD_DIR)/root/usr/libexec/trusttunnel/gen-lists
 	chmod 0755 $(PKG_BUILD_DIR)/root/usr/libexec/trusttunnel/normalize
 	chmod 0755 $(PKG_BUILD_DIR)/root/usr/libexec/trusttunnel/routing
+	chmod 0755 $(PKG_BUILD_DIR)/root/usr/libexec/trusttunnel/speedtest
 	chmod 0755 $(PKG_BUILD_DIR)/root/usr/libexec/trusttunnel/uci-export
 	chmod 0755 $(PKG_BUILD_DIR)/root/usr/libexec/trusttunnel/warm-sets
 	# records.sh подключается через `.`, запускать его не нужно.

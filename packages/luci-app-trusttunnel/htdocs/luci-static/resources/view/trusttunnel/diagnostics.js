@@ -12,6 +12,9 @@ var callProbe = rpc.declare({ object: 'luci.trusttunnel', method: 'probe' });
 var callCheckDomain = rpc.declare({
 	object: 'luci.trusttunnel', method: 'check_domain', params: [ 'domain' ]
 });
+var callSpeedStart = rpc.declare({ object: 'luci.trusttunnel', method: 'speedtest_start' });
+var callSpeedStatus = rpc.declare({ object: 'luci.trusttunnel', method: 'speedtest_status' });
+var callSpeedStop = rpc.declare({ object: 'luci.trusttunnel', method: 'speedtest_stop' });
 
 // Слово вердикта вместо цветного кружка: на узком экране и в тёмной теме
 // цвет читается хуже текста, а класс alert-message LuCI уже несёт и фон, и
@@ -149,6 +152,123 @@ var DIAG_TEXT = {
 
 function dtr(s) {
 	return (s && DIAG_TEXT[s]) ? DIAG_TEXT[s] : (s || '');
+}
+
+// --- Тест скорости -------------------------------------------------------------
+//
+// Шкала спидометра неравномерная, как у speedtest.net: на равномерной шкале
+// до гигабита типичные для домашней сети десятки мегабит слиплись бы у левого
+// края. Деления стоят на равных расстояниях друг от друга, а значение между
+// ними интерполируется линейно.
+var SPEED_TICKS = [ 0, 10, 50, 100, 250, 500, 1000 ];
+var GAUGE_ARC = Math.PI * 120;   // длина дуги радиуса 120
+var SVG_NS = 'http://www.w3.org/2000/svg';
+
+function gaugeFrac(v) {
+	var last = SPEED_TICKS.length - 1;
+	if (!(v > 0)) return 0;
+	if (v >= SPEED_TICKS[last]) return 1;
+	for (var i = 1; i <= last; i++) {
+		if (v <= SPEED_TICKS[i]) {
+			var a = SPEED_TICKS[i - 1], b = SPEED_TICKS[i];
+			return (i - 1 + (v - a) / (b - a)) / last;
+		}
+	}
+	return 1;
+}
+
+function svgEl(name, attrs, text) {
+	var n = document.createElementNS(SVG_NS, name);
+	Object.keys(attrs || {}).forEach(function(k) { n.setAttribute(k, attrs[k]); });
+	if (text != null) n.textContent = text;
+	return n;
+}
+
+// Дуга-спидометр с большим числом посередине. Поля по бокам в viewBox нужны
+// подписи последнего деления: «1000» вплотную к краю обрезается. Возвращает узел и set(значение,
+// цвет) — единственный способ его менять.
+function makeGauge() {
+	var svg = svgEl('svg', {
+		'viewBox': '-20 0 340 190', 'width': '100%',
+		'style': 'max-width:340px;display:block;margin:0 auto'
+	});
+	var d = 'M 30 150 A 120 120 0 0 1 270 150';
+	svg.appendChild(svgEl('path', {
+		'd': d, 'fill': 'none', 'stroke': 'currentColor', 'stroke-opacity': '0.15',
+		'stroke-width': '14', 'stroke-linecap': 'round'
+	}));
+	var fill = svgEl('path', {
+		'd': d, 'fill': 'none', 'stroke': '#1565c0', 'stroke-width': '14',
+		'stroke-linecap': 'round', 'stroke-dasharray': '0 ' + GAUGE_ARC,
+		'style': 'transition:stroke-dasharray .4s linear'
+	});
+	svg.appendChild(fill);
+
+	SPEED_TICKS.forEach(function(t, i) {
+		var ang = Math.PI - (i / (SPEED_TICKS.length - 1)) * Math.PI;
+		svg.appendChild(svgEl('text', {
+			'x': 150 + 138 * Math.cos(ang), 'y': 150 - 138 * Math.sin(ang) + 4,
+			'text-anchor': i === 0 ? 'end' : (i === SPEED_TICKS.length - 1 ? 'start' : 'middle'),
+			'font-size': '11', 'fill': 'currentColor', 'fill-opacity': '0.6'
+		}, String(t)));
+	});
+
+	var value = svgEl('text', {
+		'x': 150, 'y': 138, 'text-anchor': 'middle', 'font-size': '40',
+		'font-weight': 'bold', 'fill': 'currentColor'
+	}, '—');
+	svg.appendChild(value);
+	svg.appendChild(svgEl('text', {
+		'x': 150, 'y': 162, 'text-anchor': 'middle', 'font-size': '13',
+		'fill': 'currentColor', 'fill-opacity': '0.6'
+	}, _('Mbit/s')));
+
+	return {
+		node: svg,
+		set: function(v, color) {
+			var shown = v > 0;
+			value.textContent = shown ? (v < 100 ? v.toFixed(1) : String(Math.round(v))) : '—';
+			fill.setAttribute('stroke', color || '#1565c0');
+			// Нулевая заливка с круглым краем рисуется точкой и выглядит как
+			// значение, которого нет.
+			fill.setAttribute('stroke-opacity', shown ? '1' : '0');
+			fill.setAttribute('stroke-dasharray',
+				(shown ? gaugeFrac(v) * GAUGE_ARC : 0) + ' ' + GAUGE_ARC);
+		}
+	};
+}
+
+// Число или прочерк. Скорость 0 означает, что замер не удался: настоящий
+// нуль на живой сети невозможен. А jitter 0.0 — честное значение.
+function speedNum(v, digits, zeroIsMissing) {
+	if (v == null || (zeroIsMissing && !(v > 0))) return '—';
+	return v.toFixed(digits);
+}
+
+// Отношение туннеля к прямому каналу в процентах или null, если одной из
+// цифр нет.
+function speedRatio(res, key) {
+	var t = res.tunnel[key], d = res.direct[key];
+	if (!(t > 0) || !(d > 0)) return null;
+	return Math.round(t / d * 100);
+}
+
+// Вердикт по худшему из двух отношений. Пороги 70% и 40% — оценка: туннель
+// всегда что-то съедает на шифровании и обёртке, и 70–100% от прямого канала
+// это ожидаемая норма, а ниже 40% канал до сервера уже узкое место.
+function speedVerdict(res) {
+	var r = [ speedRatio(res, 'down'), speedRatio(res, 'up') ].filter(function(x) {
+		return x != null;
+	});
+	if (!r.length) return null;
+	var worst = Math.min.apply(null, r);
+	return {
+		ratio: worst,
+		level: worst >= 70 ? 'success' : (worst >= 40 ? 'warning' : 'danger'),
+		text: worst >= 70 ? _('The tunnel is not the bottleneck.')
+			: (worst >= 40 ? _('The tunnel is noticeably slower than the direct connection.')
+				: _('The tunnel is the bottleneck: it passes less than 40% of the direct speed.'))
+	};
 }
 
 var GROUP_TITLE = {
@@ -315,6 +435,122 @@ return view.extend({
 		});
 	},
 
+	// Таблица итогов: напрямую и через туннель рядом, с процентом там, где
+	// есть что сравнивать.
+	renderSpeedResults: function(s) {
+		var d = s.results.direct, t = s.results.tunnel;
+		var hasAny = Object.keys(d).length || Object.keys(t).length;
+		if (!hasAny) return [];
+
+		function cells(key, digits, zeroMissing, unit) {
+			return [
+				E('td', { 'class': 'td left' }, speedNum(d[key], digits, zeroMissing)),
+				E('td', { 'class': 'td left' }, s.tunnel_skipped ? '—'
+					: speedNum(t[key], digits, zeroMissing)),
+				E('td', { 'class': 'td left' }, unit)
+			];
+		}
+		function line(label, key, digits, zeroMissing, unit, ratio) {
+			var r = ratio ? speedRatio(s.results, key) : null;
+			var c = cells(key, digits, zeroMissing, unit);
+			c.push(E('td', { 'class': 'td left' }, r != null ? r + '%' : ''));
+			return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td left' }, label) ].concat(c));
+		}
+
+		var parts = [ E('table', { 'class': 'table', 'style': 'margin-top:1em' }, [
+			E('tr', { 'class': 'tr table-titles' }, [
+				E('th', { 'class': 'th left' }, ''),
+				E('th', { 'class': 'th left' }, _('Directly')),
+				E('th', { 'class': 'th left' }, _('Through the tunnel')),
+				E('th', { 'class': 'th left' }, ''),
+				E('th', { 'class': 'th left' }, _('Tunnel / direct'))
+			]),
+			line(_('Ping'), 'ping', 1, true, _('ms'), false),
+			line(_('Jitter'), 'jitter', 1, false, _('ms'), false),
+			line(_('Download'), 'down', 1, true, _('Mbit/s'), true),
+			line(_('Upload'), 'up', 1, true, _('Mbit/s'), true)
+		]) ];
+
+		if (s.tunnel_skipped)
+			parts.push(E('p', {}, _('The tunnel is not running, so only the direct speed was measured.')));
+
+		var v = s.tunnel_skipped ? null : speedVerdict(s.results);
+		if (v && !s.running)
+			parts.push(E('div', { 'class': 'alert-message ' + v.level }, [
+				E('strong', {}, _('The tunnel passes %d%% of the direct speed.').format(v.ratio)),
+				E('br'), v.text
+			]));
+		return parts;
+	},
+
+	// Один опрос. Пока замер идёт, вызывает сам себя через полсекунды; когда
+	// страница ушла из документа (переход на другую вкладку LuCI), останавливает
+	// замер: он тратит трафик и канал, а смотреть на него уже некому.
+	pollSpeedtest: function(ctx, initial) {
+		var self = this;
+		// Первый вызов идёт до того, как LuCI вставит страницу в документ, и
+		// проверка «ушли со страницы» его ошибочно остановила бы.
+		if (!initial && !document.body.contains(ctx.root)) {
+			callSpeedStop();
+			return;
+		}
+		return callSpeedStatus().then(function(s) {
+			var phaseName = { ping: _('Ping'), download: _('Download'), upload: _('Upload') };
+			var color = s.phase === 'upload' ? '#2e7d32' : '#1565c0';
+
+			ctx.gauge.set(s.phase === 'download' || s.phase === 'upload' ? s.live : 0, color);
+			if (s.running) {
+				var via = s.via === 'tunnel' ? _('Through the tunnel') : _('Directly');
+				ctx.status.textContent = (phaseName[s.phase] || _('Starting…')) + ' · ' + via;
+			} else if (s.error) {
+				ctx.status.textContent = s.error === 'interrupted'
+					? _('The test was interrupted.') : s.error;
+			} else if (s.phase === 'stopped') {
+				ctx.status.textContent = _('Stopped.');
+			} else if (s.phase === 'done') {
+				ctx.status.textContent = _('Done.');
+			} else {
+				ctx.status.textContent = '';
+			}
+
+			dom.content(ctx.results, self.renderSpeedResults(s));
+			ctx.start.disabled = s.running;
+			ctx.stop.style.display = s.running ? '' : 'none';
+
+			if (s.running)
+				setTimeout(function() { self.pollSpeedtest(ctx); }, 500);
+		}).catch(function(e) {
+			// Тот же довод, что у остальных обработчиков страницы: без catch
+			// обрыв опроса оставил бы стрелку и «идёт замер» навсегда.
+			ctx.status.textContent = e.message || String(e);
+			ctx.start.disabled = false;
+			ctx.stop.style.display = 'none';
+		});
+	},
+
+	handleSpeedStart: function(ctx) {
+		var self = this;
+		ctx.start.disabled = true;
+		ctx.status.textContent = _('Starting…');
+		dom.content(ctx.results, []);
+		return callSpeedStart().then(function(res) {
+			if (res.error) {
+				ctx.status.textContent = res.error;
+				ctx.start.disabled = false;
+				return;
+			}
+			ctx.stop.style.display = '';
+			return self.pollSpeedtest(ctx);
+		}).catch(function(e) {
+			ctx.status.textContent = e.message || String(e);
+			ctx.start.disabled = false;
+		});
+	},
+
+	handleSpeedStop: function(ctx) {
+		return callSpeedStop();
+	},
+
 	handleCheckDomain: function(input, container) {
 		var d = input.value.trim();
 		if (!d) return;
@@ -350,6 +586,27 @@ return view.extend({
 		var pingBox = E('div', {});
 		var probeBox = E('div', {});
 		var domainBox = E('div', {});
+
+		var speed = {
+			gauge: makeGauge(),
+			status: E('p', { 'style': 'text-align:center;min-height:1.5em;margin:.3em 0' }, ''),
+			results: E('div', {}),
+			start: E('button', { 'class': 'cbi-button cbi-button-action' }, _('Start the test')),
+			stop: E('button', {
+				'class': 'cbi-button cbi-button-negative', 'style': 'display:none'
+			}, _('Stop'))
+		};
+		speed.root = E('div', {}, [
+			speed.gauge.node, speed.status,
+			E('div', { 'style': 'text-align:center' }, [ speed.start, ' ', speed.stop ]),
+			speed.results
+		]);
+		speed.start.addEventListener('click', ui.createHandlerFn(this, 'handleSpeedStart', speed));
+		speed.stop.addEventListener('click', ui.createHandlerFn(this, 'handleSpeedStop', speed));
+		// Страницу могли обновить посреди замера или открыть после него:
+		// подхватываем то, что уже идёт или лежит с прошлого раза.
+		setTimeout(function() { self.pollSpeedtest(speed, true); }, 0);
+
 		var domainInput = E('input', {
 			'type': 'text', 'class': 'cbi-input-text',
 			'placeholder': 'youtube.com', 'style': 'width:16em'
@@ -407,6 +664,13 @@ return view.extend({
 					'click': ui.createHandlerFn(this, 'handlePing', pingBox)
 				}, _('Ping')),
 				pingBox
+			]),
+
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('Speed test')),
+				E('p', {}, _('Measures ping, download and upload directly and through the tunnel, the way speedtest.net does, and compares the two. It takes about 40 seconds and moves as much data as your link carries in that time — around half a gigabyte on a fast connection — so avoid heavy use of the network meanwhile.')),
+				E('p', { 'style': 'opacity:.7;font-size:90%' }, _('Ping is the response time of an HTTPS request, not ICMP: ICMP does not pass through the tunnel. The gauge follows the interface counters and also sees other traffic on the network; the final figures count the test traffic only.')),
+				speed.root
 			]),
 
 			E('div', { 'class': 'cbi-section' }, [

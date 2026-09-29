@@ -4,14 +4,14 @@
 		"read": {
 			"ubus": {
 				"luci.trusttunnel": [
-					"status", "ping", "probe", "check_domain", "catalog", "log", "versions", "diagnose"
+					"status", "ping", "probe", "check_domain", "catalog", "log", "versions", "diagnose", "speedtest_status"
 				]
 			},
 			"uci": [ "trusttunnel" ]
 		},
 		"write": {
 			"ubus": {
-				"luci.trusttunnel": [ "service", "import_config" ]
+				"luci.trusttunnel": [ "service", "import_config", "speedtest_start", "speedtest_stop" ]
 			},
 			"uci": [ "trusttunnel" ]
 		}

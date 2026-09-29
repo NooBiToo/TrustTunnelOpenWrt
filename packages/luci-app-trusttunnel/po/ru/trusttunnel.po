@@ -1103,3 +1103,60 @@ msgstr "Буфер передачи TCP, байт"
 
 msgid "Per connection inside the tunnel. 0 means the client default of 256 KB."
 msgstr "На каждое соединение внутри туннеля. 0 — умолчание клиента, 256 КБ."
+
+msgid "Speed test"
+msgstr "Тест скорости"
+
+msgid "Measures ping, download and upload directly and through the tunnel, the way speedtest.net does, and compares the two. It takes about 40 seconds and moves as much data as your link carries in that time — around half a gigabyte on a fast connection — so avoid heavy use of the network meanwhile."
+msgstr "Меряет пинг, загрузку и отдачу напрямую и через туннель — так же, как speedtest.net, — и сравнивает их. Замер занимает около 40 секунд и передаёт столько данных, сколько канал пропускает за это время — на быстром соединении около полугигабайта, — поэтому не нагружайте сеть в это время."
+
+msgid "Ping is the response time of an HTTPS request, not ICMP: ICMP does not pass through the tunnel. The gauge follows the interface counters and also sees other traffic on the network; the final figures count the test traffic only."
+msgstr "Пинг — это время ответа на HTTPS-запрос, а не ICMP: ICMP через туннель не проходит. Шкала идёт по счётчикам интерфейса и видит также чужой трафик сети; итоговые цифры считают только тестовый трафик."
+
+msgid "Start the test"
+msgstr "Начать замер"
+
+msgid "Starting…"
+msgstr "Запуск…"
+
+msgid "Stopped."
+msgstr "Остановлено."
+
+msgid "Done."
+msgstr "Готово."
+
+msgid "The test was interrupted."
+msgstr "Замер прерван."
+
+msgid "Mbit/s"
+msgstr "Мбит/с"
+
+msgid "ms"
+msgstr "мс"
+
+msgid "Jitter"
+msgstr "Джиттер"
+
+msgid "Download"
+msgstr "Загрузка"
+
+msgid "Upload"
+msgstr "Отдача"
+
+msgid "Tunnel / direct"
+msgstr "Туннель / напрямую"
+
+msgid "The tunnel is not running, so only the direct speed was measured."
+msgstr "Туннель не запущен, поэтому измерена только прямая скорость."
+
+msgid "The tunnel passes %d%% of the direct speed."
+msgstr "Туннель пропускает %d%% от прямой скорости."
+
+msgid "The tunnel is not the bottleneck."
+msgstr "Туннель не является узким местом."
+
+msgid "The tunnel is noticeably slower than the direct connection."
+msgstr "Туннель заметно медленнее прямого соединения."
+
+msgid "The tunnel is the bottleneck: it passes less than 40% of the direct speed."
+msgstr "Узкое место — туннель: он пропускает меньше 40% от прямой скорости."

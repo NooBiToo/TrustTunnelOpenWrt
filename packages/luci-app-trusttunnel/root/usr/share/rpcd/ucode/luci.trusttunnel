@@ -33,6 +33,9 @@ const LISTS_UPDATED = '/usr/share/trusttunnel/lists.updated';
 // OUTDIR на tmpfs, а после перезагрузки при активном захвате исходные
 // resolver_url чужого конфига надо чем-то возвращать.
 const DOH_STATE = '/usr/share/trusttunnel/doh-takeover';
+// Состояние фонового замера скорости. На tmpfs: после перезагрузки замера
+// нет, и хранить его незачем.
+const SPEEDTEST_DIR = '/var/run/trusttunnel-speedtest';
 const CATALOG_TTL = 86400;
 const CATALOG_URL = 'https://api.github.com/repos/itdoginfo/allow-domains/git/trees/main?recursive=1';
 // Проверка обновлений идёт к релизам на GitHub и кэшируется на диск: у GitHub
@@ -486,6 +489,61 @@ return {
 				tunnel: via.code == 0 ? { ip: trim(via.out) } : { error: trim(via.out) || 'request failed' },
 				direct: direct.code == 0 ? { ip: trim(direct.out) } : { error: trim(direct.out) || 'request failed' }
 			};
+		}
+	},
+
+	// Замер скорости. Идёт около 40 секунд, а вызов rpcd столько не живёт и не
+	// умеет отдавать промежуточные значения, поэтому сам замер — фоновый
+	// процесс (libexec/trusttunnel/speedtest), а здесь только запуск, опрос и
+	// остановка. Устройство туннеля берётся из живого состояния, как в probe:
+	// имя из настроек указывало бы в никуда.
+	speedtest_start: {
+		args: {},
+		call: function() {
+			let dev = routing_status().device;
+			let r = sh(LIBDIR + '/speedtest start ' + shq(SPEEDTEST_DIR) + ' ' + shq(dev ?? '-'));
+			if (r.code != 0)
+				return { error: trim(r.out) || 'could not start' };
+			return { started: true, tunnel: dev != null };
+		}
+	},
+
+	speedtest_status: {
+		args: {},
+		call: function() {
+			let out = {
+				running: false, phase: 'idle', via: null, live: 0,
+				error: null, tunnel_skipped: false,
+				results: { direct: {}, tunnel: {} }
+			};
+			// sh_out: разбирается построчно, stderr в данные попасть не должен.
+			let r = sh_out(LIBDIR + '/speedtest status ' + shq(SPEEDTEST_DIR));
+			for (let line in split(r.out, '\n')) {
+				let p = split(line, '\t');
+				if (length(p) < 2)
+					continue;
+				let k = p[0], v = p[1];
+				if (k == 'running') out.running = (v == '1');
+				else if (k == 'phase') out.phase = v;
+				else if (k == 'via') out.via = v;
+				else if (k == 'live') out.live = +v;
+				else if (k == 'error') out.error = v;
+				else if (k == 'tunnel.skipped') out.tunnel_skipped = true;
+				else {
+					let m = match(k, /^(direct|tunnel)\.(ping|jitter|down|up)$/);
+					if (m)
+						out.results[m[1]][m[2]] = +v;
+				}
+			}
+			return out;
+		}
+	},
+
+	speedtest_stop: {
+		args: {},
+		call: function() {
+			sh(LIBDIR + '/speedtest stop ' + shq(SPEEDTEST_DIR));
+			return { stopped: true };
 		}
 	},
 
