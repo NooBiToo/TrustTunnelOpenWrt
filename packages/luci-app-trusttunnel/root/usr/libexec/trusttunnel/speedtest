@@ -200,6 +200,10 @@ measure_transfer() {
 		n=$((n + 1))
 	done
 
+	# Потоки живут в подоболочке capture, и обработчик остановки в главном
+	# процессе своего PIDS не видит: пути к ним оставляем в файле.
+	echo "$PIDS" > "$DIR/streams.pid"
+
 	prev=""; prev_t=""
 	alive=1
 	while [ "$alive" = 1 ]; do
@@ -240,6 +244,20 @@ wan_device() {
 		awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
 }
 
+# Запускает команду в фоне и кладёт её вывод в CAPTURED. Не через $(...):
+# пока идёт подстановка команды, sh откладывает обработчик TERM до её конца, и
+# «Остановить» ждало бы конца фазы. Проверено на Ubuntu (dash): при трёх пингах
+# по три секунды остановка срабатывала через девять. `wait` же прерывается
+# сигналом сразу.
+capture() {
+	"$@" > "$DIR/capture" &
+	CPID=$!
+	PIDS="$CPID"
+	wait "$CPID"
+	PIDS=""
+	CAPTURED=$(cat "$DIR/capture")
+}
+
 # Один проход по пути: пинг, загрузка, отдача. Результаты кладутся под ключами
 # "<путь>.ping" и т. д.
 measure_path() {
@@ -253,28 +271,31 @@ measure_path() {
 	rm -f "$DIR/live"
 
 	put phase ping
-	r=$(measure_ping) || r=""
+	capture measure_ping
+	r="$CAPTURED"
 	if [ -n "$r" ]; then
 		put "$via.ping" "${r% *}"
 		put "$via.jitter" "${r#* }"
 	fi
 
 	put phase download
-	put "$via.down" "$(measure_transfer down)"
+	capture measure_transfer down
+	put "$via.down" "$CAPTURED"
 	rm -f "$DIR/live"
 
 	put phase upload
-	put "$via.up" "$(measure_transfer up)"
+	capture measure_transfer up
+	put "$via.up" "$CAPTURED"
 	rm -f "$DIR/live"
 }
 
 cmd_run() {
 	TUN="${3:--}"
 	PIDS=""
-	# Оборванный замер: потоки завершаются сами, самое позднее по истечении
-	# срока curl -m, поэтому достаточно остановить те, что держит этот
-	# процесс, и честно записать, что замер прерван.
-	trap 'for p in $PIDS; do kill "$p" 2>/dev/null; done; put phase stopped; exit 0' TERM INT
+	# Остановка: гасим фоновый замер и его потоки и честно пишем, что замер
+	# прерван. Уже запущенные curl дотягивают до своего -m (не дольше срока
+	# замера), но новые не стартуют.
+	trap 'for p in $PIDS $(cat "$DIR/streams.pid" 2>/dev/null); do kill "$p" 2>/dev/null; done; put phase stopped; exit 0' TERM INT
 
 	measure_path direct
 	if [ "$TUN" = "-" ]; then

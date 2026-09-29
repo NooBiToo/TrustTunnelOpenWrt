@@ -13,7 +13,10 @@ mkdir -p "$bin"
 cat > "$bin/curl" <<'EOF'
 #!/bin/sh
 echo "$*" >> "$TT_FAKE_LOG"
-sleep "${TT_FAKE_SLEEP:-0.2}"
+case "$*" in
+	*"bytes=0"*) sleep "${TT_FAKE_PING_SLEEP:-${TT_FAKE_SLEEP:-0.2}}" ;;
+	*) sleep "${TT_FAKE_SLEEP:-0.2}" ;;
+esac
 case "$*" in
 	*"bytes=0"*) printf '0.100 0.150' ;;
 	*"/__up"*)   printf '1000000' ;;
@@ -105,6 +108,31 @@ out=$(sh "$S" status "$D")
 assert_eq "0" "$(val "$out" running)" "после stop замер не идёт"
 assert_eq "stopped" "$(val "$out" phase)" "после stop фаза stopped"
 unset TT_FAKE_SLEEP
+
+# --- Остановка посреди передачи ------------------------------------------------
+# Раньше сигнал стоял в очереди до конца `$(...)`, то есть до конца фазы, и
+# «Остановить» ждало секунды: на Ubuntu (dash) остановка срабатывала лишь
+# после текущей фазы. Тут пинг быстрый, а передача долгая, чтобы остановка
+# пришлась на неё.
+D="$TT_TEST_TMP/bg2"
+TT_FAKE_PING_SLEEP=0 TT_FAKE_SLEEP=6; export TT_FAKE_PING_SLEEP TT_FAKE_SLEEP
+sh "$S" start "$D" - >/dev/null
+i=0
+while [ "$(val "$(sh "$S" status "$D")" phase)" != "download" ] && [ $i -lt 40 ]; do
+	sleep 0.2
+	i=$((i + 1))
+done
+assert_eq "download" "$(val "$(sh "$S" status "$D")" phase)" "дошли до фазы загрузки"
+sh "$S" stop "$D"
+i=0
+while [ "$(val "$(sh "$S" status "$D")" running)" = "1" ] && [ $i -lt 10 ]; do
+	sleep 0.2
+	i=$((i + 1))
+done
+out=$(sh "$S" status "$D")
+assert_eq "0" "$(val "$out" running)" "остановка посреди загрузки срабатывает сразу"
+assert_eq "stopped" "$(val "$out" phase)" "и фаза stopped, а не download"
+unset TT_FAKE_PING_SLEEP TT_FAKE_SLEEP
 
 # --- Оборванный замер ----------------------------------------------------------
 # Процесс умер, не дописав фазу: статус обязан сказать об этом, а не показывать
