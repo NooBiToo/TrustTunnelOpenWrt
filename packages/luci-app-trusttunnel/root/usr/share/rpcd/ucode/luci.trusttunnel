@@ -297,6 +297,19 @@ function set_size(name) {
 	return length(out) ? +out : -1;
 }
 
+// Размер набора обхода: адреса, которые накопил dnsmasq (tt_bypass), плюс
+// подсети из выбранных списков (tt_static). Раньше те и другие лежали в одном
+// наборе, и интерфейс считал его целиком. -1 — таблицы нет вовсе; если нет
+// только статического набора, значит работает таблица прежней структуры, и
+// считается один динамический.
+function bypass_size(family) {
+	let dyn = set_size('tt_bypass' + family);
+	if (dyn < 0)
+		return -1;
+	let st = set_size('tt_static' + family);
+	return st < 0 ? dyn : dyn + st;
+}
+
 function routing_status() {
 	// device: имя устройства, которое создал КЛИЕНТ, или null. Своего
 	// устройства у пакета больше нет, поэтому имя из настроек здесь не
@@ -400,8 +413,8 @@ return {
 				nft: rs.nft,
 				endpoint_hostname: first(rec, 'endpoint.hostname', ''),
 				addresses: rec['endpoint.address'] ?? [],
-				set4: set_size('tt_bypass4'),
-				set6: set_size('tt_bypass6'),
+				set4: bypass_size('4'),
+				set6: bypass_size('6'),
 				dnsmasq_nftset: dnsmasq_has_nftset(),
 				lists_updated: updated ? +updated : 0,
 				lists_summary: lists_summary(),
@@ -644,15 +657,18 @@ return {
 
 			let in_set = false;
 			for (let a in addrs) {
-				let set = index(a, ':') >= 0 ? 'tt_bypass6' : 'tt_bypass4';
+				let fam = index(a, ':') >= 0 ? '6' : '4';
 				// Адрес взят из вывода nslookup, а не из UCI: подстановка
 				// без кавычек в аргумент шелла была бы небезопасна для
 				// любого значения, которое сюда попадёт не проверкой типа
 				// адреса, а просто доверием к тому, что напечатал резолвер.
 				// Скобки остаются НЕ экранированными: это синтаксис nft, а
-				// не оболочки.
-				let r = sh_out('nft get element inet trusttunnel ' + set + ' { ' + shq(a) + ' }');
-				if (r.code == 0) in_set = true;
+				// не оболочки. Проверяются оба набора: адрес мог попасть и
+				// от dnsmasq, и из подсети выбранного списка.
+				for (let set in [ 'tt_bypass' + fam, 'tt_static' + fam ]) {
+					let r = sh_out('nft get element inet trusttunnel ' + set + ' { ' + shq(a) + ' }');
+					if (r.code == 0) in_set = true;
+				}
 			}
 
 			let verdict, reason;
@@ -1008,7 +1024,7 @@ return {
 				// соседними проверками: если dnsmasq умеет nftset и наш конфиг
 				// ему опубликован, то пустой набор означает ровно «никто ещё
 				// не спрашивал», и это не проблема.
-				let s4 = set_size('tt_bypass4');
+				let s4 = bypass_size('4');
 				let can_fill = dnsmasq_has_nftset() &&
 					length(trim(sh_out('ls /tmp/dnsmasq.*/trusttunnel.conf').out)) > 0;
 

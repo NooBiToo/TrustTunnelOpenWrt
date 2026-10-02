@@ -209,13 +209,13 @@ done
 	# был бы бессмысленным (цепочка nft всё равно возвращает управление на
 	# приватных адресах).
 	if [ -n "$bypass_resolver" ]; then
-		printf 'add element inet trusttunnel tt_bypass4 { %s }\n' "$bypass_resolver"
+		printf 'add element inet trusttunnel tt_static4 { %s }\n' "$bypass_resolver"
 	fi
 	sort -u "$tmp/cidr4" | while IFS= read -r c; do
-		printf 'add element inet trusttunnel tt_bypass4 { %s }\n' "$c"
+		printf 'add element inet trusttunnel tt_static4 { %s }\n' "$c"
 	done
 	sort -u "$tmp/cidr6" | while IFS= read -r c; do
-		printf 'add element inet trusttunnel tt_bypass6 { %s }\n' "$c"
+		printf 'add element inet trusttunnel tt_static6 { %s }\n' "$c"
 	done
 } > "$OUT_DIR/elements.nft"
 

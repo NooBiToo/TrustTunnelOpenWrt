@@ -37,9 +37,12 @@ assert_eq "0" "$(printf '%s\n' "$dnsmasq" | grep -c 'bank\.example')" "direct do
 # example.com встречается в двух списках — строка должна быть одна.
 assert_eq "1" "$(printf '%s\n' "$dnsmasq" | grep -c 'nftset=/example\.com/4#')" "deduplicates across sources"
 
-assert_contains "$elements" 'add element inet trusttunnel tt_bypass4 { 149.154.160.0/20 }' "ipv4 cidr element"
-assert_contains "$elements" 'add element inet trusttunnel tt_bypass6 { 2001:67c:4e8::/48 }' "ipv6 cidr element"
-assert_contains "$elements" 'add element inet trusttunnel tt_bypass4 { 1.1.1.1 }' "resolver is routed into the tunnel"
+# Подсети идут в отдельные статические наборы (см. комментарий в test_routing.sh):
+# при применении настроек их загружают заново, а не переносят.
+assert_contains "$elements" 'add element inet trusttunnel tt_static4 { 149.154.160.0/20 }' "ipv4 cidr element"
+assert_contains "$elements" 'add element inet trusttunnel tt_static6 { 2001:67c:4e8::/48 }' "ipv6 cidr element"
+assert_contains "$elements" 'add element inet trusttunnel tt_static4 { 1.1.1.1 }' "resolver is routed into the tunnel"
+assert_eq "0" "$(printf '%s\n' "$elements" | grep -c 'tt_bypass')" "elements.nft never writes into the dynamic sets"
 
 # Источники дают 9 уникальных доменов (ua, example.com, blocked.example,
 # bank.example, sub.bank.example, youtube.com, ytimg.com, mysite.example,
@@ -170,7 +173,7 @@ sed 's/^network.tunnel_list_dns\t1$/network.list_dns\tplain/' "$TT_TEST_TMP/sel.
 outp="$TT_TEST_TMP/out-plain"; mkdir -p "$outp"
 sh "$GEN" "$TT_TEST_TMP/plain.tsv" "$LISTS" "$outp" >/dev/null
 assert_contains "$(cat "$outp/dnsmasq.conf")" 'server=/youtube.com/1.1.1.1' "plain: per-domain resolver"
-assert_contains "$(cat "$outp/elements.nft")" 'tt_bypass4 { 1.1.1.1 }' "plain: resolver goes into the bypass set"
+assert_contains "$(cat "$outp/elements.nft")" 'tt_static4 { 1.1.1.1 }' "plain: resolver goes into the static set"
 
 # doh: запрос уходит на локальный прокси, и в наборе резолвера быть НЕ должно —
 # шифрованный запрос идёт напрямую, а не через туннель.
