@@ -44,6 +44,16 @@ assert_contains "$full" "meta mark set 0x9527" "full marks everything"
 assert_eq "0" "$(printf '%s\n' "$full" | grep -c '@tt_bypass4 meta mark')" "full does not consult the bypass set"
 assert_contains "$full" "type route hook output priority mangle" "router traffic chain when requested"
 
+# Исходящие соединения демона tgws (luci-app-tgws) несут отметку 0x7467 и
+# должны идти напрямую: возврат стоит ДО правил маркировки, иначе при
+# включённом «Трафик роутера через VPN» Telegram-трафик демона ушёл бы в туннель.
+assert_contains "$full" "meta mark 0x7467 return" "the tgws daemon's own sockets are never tunnelled"
+out_chain="$(printf '%s\n' "$full" | awk '/hook output/{f=1} f')"
+ret_line=$(printf '%s\n' "$out_chain" | grep -n 'meta mark 0x7467 return' | head -n1 | cut -d: -f1)
+set_line=$(printf '%s\n' "$out_chain" | grep -n 'meta mark set' | head -n1 | cut -d: -f1)
+assert_eq "yes" "$([ -n "$ret_line" ] && [ "$ret_line" -lt "$set_line" ] && echo yes || echo no)" "the tgws return precedes the marking rule"
+assert_eq "0" "$(printf '%s\n' "$sel" | grep -c 'meta mark 0x7467')" "no output chain, no tgws rule, unless router traffic is routed"
+
 # Перехват DNS выключен по умолчанию и включается только в селективном режиме.
 assert_eq "0" "$(printf '%s\n' "$sel" | grep -c 'hook prerouting priority dstnat')" \
 	"no dns redirect unless requested"

@@ -81,6 +81,7 @@ sh -c "$(wget -O - https://raw.githubusercontent.com/NooBiToo/TrustTunnelOpenWrt
 | **Всё через VPN** | Интернет-трафик LAN с учётом исключений | Нужен туннель для всей домашней сети |
 
 Трафик самого роутера включается отдельной настройкой.
+Демон Telegram из отдельного проекта [tgws-openwrt](https://github.com/NooBiToo/tgws-openwrt) ходит напрямую: его сокеты помечены `0x7467` и исключены из туннеля.
 Подробнее: [режимы маршрутизации](GUIDE.ru.md#два-режима-работы) и [killswitch](GUIDE.ru.md#killswitch).
 
 ## Что важно знать

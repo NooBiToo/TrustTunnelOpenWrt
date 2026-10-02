@@ -82,6 +82,7 @@ Use the external IP comparison to check the tunnel's exit address alongside your
 | **Everything through VPN** | LAN internet traffic, with exclusions | Tunnel internet traffic for the whole home network |
 
 Routing the router's own traffic is a separate option.
+The Telegram daemon from the separate [tgws-openwrt](https://github.com/NooBiToo/tgws-openwrt) project connects directly: its sockets are marked `0x7467` and excluded from the tunnel.
 See [routing modes](GUIDE.en.md#two-modes) and [killswitch](GUIDE.en.md#killswitch) for details.
 
 ## Things to know
