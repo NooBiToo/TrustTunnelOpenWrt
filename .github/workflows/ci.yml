@@ -131,12 +131,19 @@ jobs:
       # Версия закреплена по той же причине, что и версия shellcheck:
       # незакреплённый инструмент ломает сборку сам по себе в произвольный
       # момент, при полностью неизменном коде.
+      #
+      # Закреплённая версия не спасает от смены компилятора: на ubuntu-26.04
+      # (GCC 15, glibc с const-сохраняющим strrchr из C23) сам ucode не
+      # собирается — его -Werror превращает discarded-qualifiers в ошибку в
+      # compiler.c и lib.c. Это предупреждение о его коде, не о нашем, поэтому
+      # снимается только оно; остальные по-прежнему ошибки.
       - name: ucode syntax
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential cmake libjson-c-dev pkg-config
           git clone --depth 1 -b v0.0.20250529 https://github.com/jow-/ucode /tmp/ucode
           cmake -S /tmp/ucode -B /tmp/ucode/build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS=-Wno-error=discarded-qualifiers \
             -DFS_SUPPORT=ON -DMATH_SUPPORT=ON \
             -DUBUS_SUPPORT=OFF -DUCI_SUPPORT=OFF -DRTNL_SUPPORT=OFF \
             -DNL80211_SUPPORT=OFF -DRESOLV_SUPPORT=OFF -DLOG_SUPPORT=OFF \
