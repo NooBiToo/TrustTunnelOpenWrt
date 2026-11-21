@@ -170,9 +170,9 @@ The **Network** tab is rarely needed: MTU and the routing internals live there.
 ### Settings
 
 Both forms a server hands out are accepted: the configuration file text, and a
-`tt://` deep link. They are told apart automatically, because `setup_wizard`
-takes them through different, mutually exclusive flags — feeding a link in as
-if it were a file makes it fail to parse outright.
+`tt://` deep link. They are told apart automatically, because the client's
+setup wizard takes them through different, mutually exclusive flags — feeding
+a link in as if it were a file makes it fail to parse outright.
 
 The fast path is **Import endpoint configuration**: paste the configuration
 text your TrustTunnel server generated, and the fields fill themselves in.
@@ -564,7 +564,7 @@ dnsmasq rules.
 | `/var/etc/trusttunnel/elements.nft` | Static nftables set elements |
 | `/var/etc/trusttunnel/own.domains` | Your own domains after normalisation — the service resolves them itself to fill the set without waiting for a client query |
 | `/tmp/dnsmasq.<section>.d/trusttunnel.conf` | A **copy** (not a link) of the rules dnsmasq reads; the path depends on dnsmasq's UCI section name |
-| `/opt/trusttunnel_client/` | The `trusttunnel_client` and `setup_wizard` binaries |
+| `/opt/trusttunnel_client/` | The `trusttunnel_client` binary; 1.1.x clients also have `setup_wizard` next to it |
 
 The file in dnsmasq's conf-dir is a plain copy, not a symlink — deliberately.
 dnsmasq on OpenWrt runs inside a ujail that does not mount
