@@ -85,7 +85,10 @@ What the script does:
 5. Detects the architecture and installs the client binary with
    TrustTunnel's own installer script into `/opt/trusttunnel_client` — the
    latest client release, not the version hard-coded in the vendor's script.
-   To pin a version, put `TT_CLIENT_VERSION=1.1.5` before the install command.
+   The vendor's script comes from the release of that same version, because
+   the 1.3.0 installer refuses 1.1.x clients. To pin a version, including a
+   rollback to 1.1.x, put `TT_CLIENT_VERSION=1.1.12` before the install
+   command. If the GitHub API does not answer, 1.3.0 is installed.
 6. Restarts `rpcd` so LuCI picks up the new backend.
 
 The script is idempotent: running it again updates the package and the

@@ -5,8 +5,13 @@ set -e
 
 REPO="${TT_REPO:-NooBiToo/TrustTunnelOpenWrt}"
 CLIENT_DIR=/opt/trusttunnel_client
-CLIENT_INSTALLER=https://raw.githubusercontent.com/TrustTunnel/TrustTunnelClient/refs/heads/master/scripts/install.sh
+CLIENT_RAW=https://raw.githubusercontent.com/TrustTunnel/TrustTunnelClient
 CLIENT_RELEASE=https://api.github.com/repos/TrustTunnel/TrustTunnelClient/releases/latest
+# Версия клиента на случай, когда GitHub API не ответил. Раньше в этом случае
+# ставилась версия, зашитая в установщик вендора, но с 1.3.0 так нельзя: там
+# по-прежнему 1.1.5, а сам установщик отказывается ставить архив с отдельным
+# setup_wizard, который в 1.1.5 есть. Поднимать вместе с проверенным релизом.
+CLIENT_FALLBACK_VERSION=1.3.0
 
 say()  { printf '%s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -124,6 +129,43 @@ else
 	say "   note: no translation package in this release; the interface will be English"
 fi
 
+# --- Установщик клиента -------------------------------------------------------
+# Версия выбирается и установщик вендора скачивается ЗДЕСЬ, до остановки
+# службы: опечатка в TT_CLIENT_VERSION или недоступный GitHub должны обрывать
+# скрипт, пока туннель ещё работает, а не после того как его сняли.
+#
+# Версия передаётся явно (-V) из последнего релиза вендора. Без неё установщик
+# ставит зашитую в него версию, а вендор перестал её поднимать: и в master, и
+# в теге v1.3.0 там по-прежнему 1.1.5. Выходило, что страница состояния
+# предлагает 1.1.7, а повторный install.sh снова ставит 1.1.5 — тот, что
+# падает на роутерах без IPv6 (TrustTunnelClient#92). TT_CLIENT_VERSION
+# закрепляет версию вручную, например для отката. Если GitHub API не ответил,
+# ставится CLIENT_FALLBACK_VERSION: старый клиент лучше, чем никакого.
+#
+# Сам установщик берётся из тега ТОЙ ЖЕ версии, а не из master, — так велит и
+# вендор. Установщик 1.3.0 отказывается ставить архив, в котором есть
+# отдельный setup_wizard ("Use the installer from the matching release"), а он
+# есть во всех 1.1.x. Из master откат на 1.1.x через TT_CLIENT_VERSION
+# обрывался бы этой ошибкой посреди установки, когда прежний клиент уже удалён.
+# Флаги -a, -o и -V у установщиков 1.1.5, 1.1.12 и 1.3.0 одинаковые.
+say "== Fetching the TrustTunnel client installer"
+client_ver=${TT_CLIENT_VERSION:-}
+if [ -z "$client_ver" ]; then
+	client_ver=$(curl -fsSL "$CLIENT_RELEASE" 2>/dev/null \
+		| sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+	if [ -z "$client_ver" ]; then
+		client_ver=$CLIENT_FALLBACK_VERSION
+		say "warning: cannot find the latest client release; installing $client_ver"
+	fi
+fi
+client_ver=${client_ver#v}
+say "   version $client_ver"
+# Скрипт скачивается в файл, а не идёт конвейером в sh: у `curl | sh`
+# недоступный адрес (опечатка в TT_CLIENT_VERSION даёт 404) превращался в
+# пустой скрипт, который «успешно» ничего не делал.
+curl -fsSL -o "$tmp/client-install.sh" "$CLIENT_RAW/refs/tags/v$client_ver/scripts/install.sh" \
+	|| die "cannot download the installer of TrustTunnel client $client_ver; is there such a release?"
+
 # Служба останавливается перед подменой файлов: иначе работающий клиент
 # продолжит крутить старую конфигурацию.
 # Запомнить, работала ли служба: в конце её надо вернуть в прежнее состояние.
@@ -154,28 +196,10 @@ mkdir -p "$CLIENT_DIR"
 # при ПОВТОРНОЙ установке, то есть на обычном пути обновления. Без флага
 # установщик там повиснет, а в неинтерактивном окружении (запуск из скрипта
 # или из cron) чтение из /dev/tty ещё и недоступно вовсе. Ответ «да» здесь
-# правдив: службу мы остановили выше, до подмены бинарника.
-#
-# Версия передаётся явно (-V) из последнего релиза вендора. Без неё установщик
-# ставит зашитую в него версию, а вендор перестал её поднимать: и в master, и
-# в теге v1.1.7 там по-прежнему 1.1.5. Выходило, что страница состояния
-# предлагает 1.1.7, а повторный install.sh снова ставит 1.1.5 — тот, что
-# падает на роутерах без IPv6 (TrustTunnelClient#92). TT_CLIENT_VERSION
-# закрепляет версию вручную, например для отката. Если GitHub API не ответил,
-# остаётся версия установщика: старый клиент лучше, чем никакого.
-client_ver=${TT_CLIENT_VERSION:-}
-if [ -z "$client_ver" ]; then
-	client_ver=$(curl -fsSL "$CLIENT_RELEASE" 2>/dev/null \
-		| sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
-fi
-client_ver=${client_ver#v}
-if [ -n "$client_ver" ]; then
-	say "   version $client_ver"
-	curl -fsSL "$CLIENT_INSTALLER" | sh -s - -a y -o "$CLIENT_DIR" -V "$client_ver"
-else
-	say "warning: cannot find the latest client release; installing the version the vendor installer defaults to"
-	curl -fsSL "$CLIENT_INSTALLER" | sh -s - -a y -o "$CLIENT_DIR"
-fi
+# правдив: службу мы остановили выше, до подмены бинарника. Версию и сам
+# установщик выбрали выше, до остановки службы.
+sh "$tmp/client-install.sh" -a y -o "$CLIENT_DIR" -V "$client_ver" \
+	|| die "the TrustTunnel client installer failed"
 [ -x "$CLIENT_DIR/trusttunnel_client" ] || die "client binary was not installed"
 
 say "== Restarting LuCI backend"
