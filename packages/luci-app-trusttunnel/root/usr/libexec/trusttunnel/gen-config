@@ -49,6 +49,21 @@ loglevel=$(tt_get main.log_level info)
 protocol=$(tt_get endpoint.protocol http2)
 custom_sni=$(tt_get endpoint.custom_sni)
 client_random=$(tt_get endpoint.client_random)
+client_random_auth_key=$(tt_get endpoint.client_random_auth_key)
+
+# tls_profile появился в клиенте 1.3.0. Клиент 1.3.0 на неизвестное значение
+# не стартует вовсе: разбор конфига обрывается на "Unexpected endpoint
+# tls_profile value". Поэтому пропускается только список клиента, а всё
+# прочее превращается в пустую строку — клиент читает её как умолчание
+# (chrome). Устаревший "default" клиент ещё принимает с предупреждением в
+# журнале, так что пакет сразу пишет его замену. Клиенты 1.1.x ключ молча
+# игнорируют, как и client_random_auth_key.
+tls_profile=$(tt_get endpoint.tls_profile)
+case "$tls_profile" in
+	chrome|chrome_canary|safari|firefox|okhttp|openssl|boringssl) ;;
+	default) tls_profile=boringssl ;;
+	*) tls_profile= ;;
+esac
 
 # Числовые ключи идут в TOML голыми числами. Мусор вместо числа сломал бы
 # разбор конфига целиком, и клиент не стартовал бы вовсе — поэтому всё, что
@@ -128,9 +143,11 @@ has_ipv6 = $(tt_bool endpoint.has_ipv6 1)
 username = "$(esc "$username")"
 password = "$(esc "$password")"
 client_random = "$(esc "$client_random")"
+client_random_auth_key = "$(esc "$client_random_auth_key")"
 skip_verification = $(tt_bool endpoint.skip_verification 0)
 $(emit_certificate)
 upstream_protocol = "$(esc "$protocol")"
+tls_profile = "${tls_profile}"
 anti_dpi = $(tt_bool endpoint.anti_dpi 0)
 dns_upstreams = ${dns_upstreams}
 

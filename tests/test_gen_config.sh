@@ -37,6 +37,10 @@ assert_contains "$out_min" 'has_ipv6 = true' "has_ipv6 defaults on"
 assert_contains "$out_min" 'dns_upstreams = []' "no dns upstreams by default"
 assert_contains "$out_min" 'custom_sni = ""' "custom_sni empty by default"
 assert_contains "$out_min" 'client_random = ""' "client_random empty by default"
+# Ключи клиента 1.3.0. Пустая строка у клиента значит умолчание: tls_profile —
+# chrome, ключ аутентификации — не задан. Клиенты 1.1.x оба ключа игнорируют.
+assert_contains "$out_min" 'tls_profile = ""' "tls_profile empty by default"
+assert_contains "$out_min" 'client_random_auth_key = ""' "client_random_auth_key empty by default"
 
 # Настройки исключений и буферов клиента (появились в клиенте 1.0.63 и 1.1.5).
 # Дефолты совпадают с дефолтами клиента, кроме early-ack: вендор рекомендует
@@ -59,6 +63,8 @@ assert_contains "$out_full" 'mtu_size = 1400' "mtu from config"
 assert_contains "$out_full" 'dns_upstreams = ["tls://1.1.1.1", "quic://dns.adguard.com:8853"]' "dns upstreams array"
 assert_contains "$out_full" 'custom_sni = "cdn.example.net"' "custom_sni from config"
 assert_contains "$out_full" 'client_random = "a1b2c3d4/ffffffff"' "client_random from config"
+assert_contains "$out_full" 'client_random_auth_key = "00112233445566778899aabbccddeeff"' "client_random_auth_key from config"
+assert_contains "$out_full" 'tls_profile = "firefox"' "tls_profile from config"
 assert_contains "$out_full" 'exclusions_tcp_early_ack_enabled = false' "early ack can be turned off"
 assert_contains "$out_full" 'exclusions_preresolve_enabled = false' "preresolve can be turned off"
 assert_contains "$out_full" 'exclusions_preresolve_max_queries = 10' "preresolve limit from config"
@@ -76,6 +82,22 @@ sed -e "s/^network.preresolve_max${tab}.*/network.preresolve_max${tab}abc/" \
 out_junk="$(sh "$GEN" "$TT_TEST_TMP/junk.tsv")"
 assert_contains "$out_junk" 'exclusions_preresolve_max_queries = 50' "non-numeric preresolve limit falls back to default"
 assert_contains "$out_junk" 'tcp_recv_buf_size = 0' "negative tcp buffer falls back to default"
+
+# Неизвестный tls_profile клиент 1.3.0 не пропускает: конфиг не разбирается,
+# и клиент не стартует. Поэтому всё, чего нет в списке клиента, превращается
+# в пустую строку, то есть в умолчание. Устаревший "default" клиент ещё
+# принимает с предупреждением; пакет сразу пишет его замену, "boringssl".
+tls_case() { # tls_case <значение в records>
+	sed -e "s/^endpoint.tls_profile${tab}.*/endpoint.tls_profile${tab}$1/" \
+		"$FULL" > "$TT_TEST_TMP/tls.tsv"
+	sh "$GEN" "$TT_TEST_TMP/tls.tsv"
+}
+assert_contains "$(tls_case chrome2)" 'tls_profile = ""' "unknown tls_profile falls back to the client default"
+assert_contains "$(tls_case 'chrome\" x')" 'tls_profile = ""' "tls_profile cannot inject TOML"
+assert_contains "$(tls_case default)" 'tls_profile = "boringssl"' "deprecated default alias becomes boringssl"
+for p in chrome chrome_canary safari firefox okhttp openssl boringssl; do
+	assert_contains "$(tls_case "$p")" "tls_profile = \"$p\"" "tls_profile $p passes through"
+done
 assert_contains "$out_full" 'password = "pa\"ss\\with"' "escapes quotes and backslashes"
 
 assert_contains "$out_full" 'exclusions = ["bank.example", "*.local.example", "listed-one.example", "listed-two.example"]' \

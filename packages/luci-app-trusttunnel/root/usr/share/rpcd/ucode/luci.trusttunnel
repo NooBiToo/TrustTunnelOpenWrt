@@ -861,11 +861,21 @@ return {
 			// обходить» на нём работают; не действуют только настройки
 			// исключений и буферов TCP со вкладки «Сеть».
 			let cl_old = cl && clver != 'installed' && vercmp(clver, CLIENT_MIN) < 0;
-			add('prereq', 'TrustTunnel client', !cl ? 'fail' : (cl_old ? 'warn' : 'ok'),
+			// Ключ аутентификации и профиль TLS клиент 1.1.x молча
+			// игнорирует. С профилем это только потеря маскировки, а с
+			// ключом — отказ: сервер, который проверяет client_random по
+			// ключу, такого клиента не пускает, и выглядит это как
+			// «туннель не поднимается» без единой подсказки в журнале.
+			let v13_keys = length(first(rec, 'endpoint.client_random_auth_key', '')) ||
+				length(first(rec, 'endpoint.tls_profile', ''));
+			let cl_pre13 = cl && clver != 'installed' && v13_keys &&
+				vercmp(clver, CLIENT_V13) < 0;
+			add('prereq', 'TrustTunnel client', !cl ? 'fail' : ((cl_old || cl_pre13) ? 'warn' : 'ok'),
 				cl ? clver : 'not installed',
 				!cl ? 'Run install.sh — the package does not ship the client binary.'
+				    : (cl_pre13 ? 'This client is older than 1.3.0 and ignores the TLS profile and the client random auth key from Settings, so a server that checks the auth key turns it away. Run install.sh again to update it.'
 				    : (cl_old ? 'Older than ' + CLIENT_MIN + ': the exclusion and TCP buffer settings on the Network tab have no effect on this client. Run install.sh again to update it.'
-				              : ''));
+				              : '')));
 
 			let nft_ok = dnsmasq_has_nftset();
 			add('prereq', 'dnsmasq nftset support', nft_ok ? 'ok' : (mode == 'full' ? 'warn' : 'fail'),
@@ -1329,6 +1339,13 @@ return {
 			// форме: строка в кавычках, массив в скобках, true/false.
 			// Строки берутся только непустыми — мастер печатает пустые
 			// кавычки для незаданных полей.
+			//
+			// Исключение — client_random_auth_key: его отдаём и пустым, если
+			// мастер (1.3.0+) напечатал строку с ним. Ключ у клиента главнее
+			// префикса client_random, и забытый от прошлого сервера ключ
+			// не пустил бы на новый, который ключа не выдаёт. Старый мастер
+			// строки не печатает вовсе — тогда поле отсутствует в ответе, и
+			// интерфейс ключ не трогает.
 			function unquote(v) {
 				let m = match(v, /^"(.*)"$/);
 				return m ? m[1] : null;
@@ -1356,6 +1373,19 @@ return {
 				case 'certificate': case 'custom_sni': case 'client_random':
 					s = unquote(v);
 					if (s != null && length(s)) res[k] = s;
+					break;
+				case 'client_random_auth_key':
+					s = unquote(v);
+					if (s != null) res[k] = s;
+					break;
+				case 'tls_profile':
+					// Мастер 1.3.0 пишет "chrome" и тогда, когда сервер
+					// профиль не задал. Умолчание пакета — пустая строка, она
+					// же chrome у клиента, поэтому chrome не переносится: так
+					// поле остаётся пустым, а не выглядит выбранным вручную.
+					s = unquote(v);
+					if (s == 'default') s = 'boringssl';
+					if (s != null && length(s) && s != 'chrome') res[k] = s;
 					break;
 				case 'upstream_protocol':
 					s = unquote(v);

@@ -35,7 +35,8 @@ for o in enabled mode full_exclude_lists log_level; do scalar main "$o"; done
 # в records не может содержать перевод строки. Сертификат пишет в отдельный
 # файл init-скрипт и передаёт его gen-config третьим аргументом.
 for o in hostname username password protocol anti_dpi post_quantum \
-		skip_verification has_ipv6 custom_sni client_random; do
+		skip_verification has_ipv6 custom_sni client_random \
+		client_random_auth_key tls_profile; do
 	scalar endpoint "$o"
 done
 listopt endpoint address

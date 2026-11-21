@@ -16,6 +16,8 @@ config endpoint 'endpoint'
 	option has_ipv6 '1'
 	option custom_sni ''
 	option client_random ''
+	option client_random_auth_key ''
+	option tls_profile ''
 
 config network 'network'
 	option mtu '1350'

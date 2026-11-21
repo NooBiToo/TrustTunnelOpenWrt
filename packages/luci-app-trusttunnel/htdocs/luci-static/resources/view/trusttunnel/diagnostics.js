@@ -88,6 +88,7 @@ var DIAG_TEXT = {
 	'Without it the TLS session uses the bare address, which many servers reject.': _('Without it the TLS session uses the bare address, which many servers reject.'),
 	'In "bypass by list" mode nothing is routed until at least one list is selected.': _('In "bypass by list" mode nothing is routed until at least one list is selected.'),
 	'Run install.sh — the package does not ship the client binary.': _('Run install.sh — the package does not ship the client binary.'),
+	'This client is older than 1.3.0 and ignores the TLS profile and the client random auth key from Settings, so a server that checks the auth key turns it away. Run install.sh again to update it.': _('This client is older than 1.3.0 and ignores the TLS profile and the client random auth key from Settings, so a server that checks the auth key turns it away. Run install.sh again to update it.'),
 	'Install dnsmasq-full, or switch to "everything through VPN" mode.': _('Install dnsmasq-full, or switch to "everything through VPN" mode.'),
 	'Not needed in "everything through VPN" mode, but "bypass by list" would not work.': _('Not needed in "everything through VPN" mode, but "bypass by list" would not work.'),
 	'Install kmod-tun.': _('Install kmod-tun.'),

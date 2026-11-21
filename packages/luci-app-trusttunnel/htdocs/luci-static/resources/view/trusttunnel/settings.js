@@ -151,6 +151,26 @@ return view.extend({
 								uci.set('trusttunnel', 'endpoint', 'custom_sni', res.custom_sni);
 							if (res.client_random)
 								uci.set('trusttunnel', 'endpoint', 'client_random', res.client_random);
+							// Ключ аутентификации бэкенд отдаёт и пустым, если
+							// мастер клиента 1.3.0+ его напечатал: тогда это
+							// «сервер ключа не выдаёт», и ключ от прошлого
+							// сервера надо снять — у клиента он главнее
+							// префикса и не пустил бы на новый сервер. Если
+							// ключ есть, снимается префикс: сервер считает их
+							// взаимоисключающими, а клиент с обоими пишет в
+							// журнал предупреждение и префикс всё равно
+							// отбрасывает. Старый мастер поля не отдаёт вовсе,
+							// и тогда здесь ничего не меняется.
+							if (res.client_random_auth_key != null) {
+								if (res.client_random_auth_key) {
+									uci.set('trusttunnel', 'endpoint', 'client_random_auth_key', res.client_random_auth_key);
+									uci.unset('trusttunnel', 'endpoint', 'client_random');
+								} else {
+									uci.unset('trusttunnel', 'endpoint', 'client_random_auth_key');
+								}
+							}
+							if (res.tls_profile)
+								uci.set('trusttunnel', 'endpoint', 'tls_profile', res.tls_profile);
 							if (res.protocol)
 								uci.set('trusttunnel', 'endpoint', 'protocol', res.protocol);
 							if (res.has_ipv6 == '1')
@@ -409,6 +429,33 @@ return view.extend({
 				return true;
 			return _('Expected a hex string, optionally followed by /mask');
 		};
+
+		// Два поля клиента 1.3.0. Клиенты 1.1.x их молча игнорируют, и с
+		// ключом это не мелочь: сервер, который проверяет client_random по
+		// ключу, такого клиента не пускает. Об этом предупреждает диагностика.
+		o = s.option(form.Value, 'client_random_auth_key', _('Client random auth key'),
+			_('Hex key issued by a TrustTunnel server that checks the TLS client random by key rather than by prefix. When set, the client random prefix above is ignored. Needs client 1.3.0 or newer; the import fills it in.'));
+		o.optional = true;
+		o.password = true;
+		o.validate = function(section_id, value) {
+			if (!value || /^[0-9a-fA-F]+$/.test(value))
+				return true;
+			return _('Expected a hex string');
+		};
+
+		// Пустое значение — умолчание клиента, chrome. Отдельный пункт chrome
+		// не нужен: он совпал бы с умолчанием. Устаревший синоним default
+		// не предлагается, gen-config всё равно пишет вместо него boringssl.
+		o = s.option(form.ListValue, 'tls_profile', _('TLS fingerprint'),
+			_('Which browser or library the TLS handshake imitates. Change it only when your server configuration sets it or the default gets blocked; the import fills it in. Needs client 1.3.0 or newer, older clients always look like Chrome.'));
+		o.value('', _('Chrome (default)'));
+		o.value('chrome_canary', 'Chrome Canary');
+		o.value('firefox', 'Firefox');
+		o.value('safari', 'Safari');
+		o.value('okhttp', 'OkHttp (Android)');
+		o.value('openssl', 'OpenSSL');
+		o.value('boringssl', 'BoringSSL');
+		o.optional = true;
 
 		o = s.option(form.ListValue, 'protocol', _('Transport'));
 		o.value('http2', 'HTTP/2');

@@ -15,6 +15,8 @@ endpoint.has_ipv6	0
 endpoint.dns_upstream	tls://1.1.1.1
 endpoint.dns_upstream	quic://dns.adguard.com:8853
 endpoint.client_random	a1b2c3d4/ffffffff
+endpoint.client_random_auth_key	00112233445566778899aabbccddeeff
+endpoint.tls_profile	firefox
 endpoint.custom_sni	cdn.example.net
 network.device	tt0
 network.mtu	1400

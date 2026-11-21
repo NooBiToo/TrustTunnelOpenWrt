@@ -630,6 +630,9 @@ msgstr "В режиме «обход по списку» ничего не ма�
 msgid "Run install.sh — the package does not ship the client binary."
 msgstr "Запустите install.sh — пакет не содержит бинарник клиента."
 
+msgid "This client is older than 1.3.0 and ignores the TLS profile and the client random auth key from Settings, so a server that checks the auth key turns it away. Run install.sh again to update it."
+msgstr "Клиент старше 1.3.0 не знает отпечатка TLS и ключа аутентификации client random из настроек, поэтому сервер, проверяющий ключ, его не пустит. Запустите install.sh ещё раз, чтобы обновить клиент."
+
 msgid "Install dnsmasq-full, or switch to \"everything through VPN\" mode."
 msgstr "Установите dnsmasq-full или переключитесь в режим «всё через VPN»."
 
@@ -1064,6 +1067,24 @@ msgstr "Метка защиты сервера от сканеров: hex-пре
 
 msgid "Expected a hex string, optionally followed by /mask"
 msgstr "Ожидается hex-строка, при необходимости с /маской"
+
+msgid "Client random auth key"
+msgstr "Ключ аутентификации client random"
+
+msgid "Hex key issued by a TrustTunnel server that checks the TLS client random by key rather than by prefix. When set, the client random prefix above is ignored. Needs client 1.3.0 or newer; the import fills it in."
+msgstr "Hex-ключ от сервера TrustTunnel, который проверяет client random в TLS по ключу, а не по префиксу. Если ключ задан, префикс client random выше не используется. Нужен клиент 1.3.0 или новее; импорт заполняет сам."
+
+msgid "Expected a hex string"
+msgstr "Ожидается hex-строка"
+
+msgid "TLS fingerprint"
+msgstr "Отпечаток TLS"
+
+msgid "Which browser or library the TLS handshake imitates. Change it only when your server configuration sets it or the default gets blocked; the import fills it in. Needs client 1.3.0 or newer, older clients always look like Chrome."
+msgstr "Под какой браузер или библиотеку маскируется TLS-рукопожатие. Меняйте, только если это задано в конфигурации сервера или умолчание начали блокировать; импорт заполняет сам. Нужен клиент 1.3.0 или новее, старые всегда выглядят как Chrome."
+
+msgid "Chrome (default)"
+msgstr "Chrome (по умолчанию)"
 
 msgid "Read the TLS server name before connecting"
 msgstr "Читать имя сервера TLS до соединения"

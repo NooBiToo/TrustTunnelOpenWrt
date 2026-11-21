@@ -176,11 +176,14 @@ a link in as if it were a file makes it fail to parse outright.
 
 The fast path is **Import endpoint configuration**: paste the configuration
 text your TrustTunnel server generated, and the fields fill themselves in.
-Parsing is done by the client own `setup_wizard` utility, so exactly the
-formats TrustTunnel itself understands are supported. The import takes every
-server field: addresses, host name, credentials, certificate, `custom_sni`,
-`client_random`, DNS servers, transport, and the anti-DPI and certificate
-verification flags.
+Parsing is done by the setup wizard that ships with the client
+(`trusttunnel_client --setup-wizard` since client 1.3.0, the separate
+`setup_wizard` before that), so exactly the formats TrustTunnel itself
+understands are supported. The import takes every server field: addresses,
+host name, credentials, certificate, `custom_sni`, `client_random`, the client
+random auth key, the TLS fingerprint, DNS servers, transport, and the anti-DPI
+and certificate verification flags. `tt://` links from servers 1.3 and newer
+can only be parsed by client 1.3.0 or newer.
 
 Filled in by hand:
 
@@ -653,6 +656,8 @@ by hand** — they are overwritten on every start.
 | `dns_upstream` | — | DNS servers for queries inside the tunnel. Empty means unfiltered AdGuard DNS |
 | `custom_sni` | — | Name sent in the TLS handshake instead of `hostname`, when the server is set up that way |
 | `client_random` | — | Client random prefix for the server's scanner protection, `hex[/mask]`; such a server rejects clients without it |
+| `client_random_auth_key` | — | Key for the same protection in the form used by server 1.3.1, hex; when set, the prefix is not used. Client 1.3.0+ |
+| `tls_profile` | — | TLS ClientHello fingerprint: `chrome_canary`, `firefox`, `safari`, `okhttp`, `openssl`, `boringssl`. Empty means `chrome`. Client 1.3.0+ |
 
 ### `network` section
 
